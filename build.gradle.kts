@@ -10,6 +10,10 @@ allprojects {
 
     repositories {
         mavenCentral()
+        maven {
+            name = "confluent"
+            url = uri("https://packages.confluent.io/maven/")
+        }
     }
 }
 

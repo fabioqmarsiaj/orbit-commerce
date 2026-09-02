@@ -33,21 +33,35 @@ Schema Registry and Kafka UI reachable over HTTP, and a real produce/consume rou
 through `order.events` succeeded.
 
 ## Phase 2 — order-service (Saga core)
-- [ ] P0 Spring Boot 4 setup (Java 21, virtual threads enabled)
-- [ ] P0 `Order` domain model as an event-sourced aggregate (states: CREATED,
-      STOCK_RESERVED, PAYMENT_APPROVED, SHIPPED, COMPLETED, CANCELLED, FAILED)
-- [ ] P0 Event store (`order_events` table) + `outbox` table
-- [ ] P0 REST API: `POST /orders`, `GET /orders/{id}`
-- [ ] P0 Publish `OrderCreated` via outbox + poller (@Scheduled)
-- [ ] P0 Saga orchestration: send commands (ReserveStockCommand, ProcessPaymentCommand,
-      CreateShipmentCommand) in reaction to received events
-- [ ] P0 Listeners for StockReserved/StockRejected, PaymentApproved/PaymentDeclined,
-      ShipmentCreated/ShipmentFailed
-- [ ] P0 Compensation logic (cancellation, refund, stock release)
+- [x] P0 Spring Boot 4 setup (Java 21) — scaffolded; virtual threads not yet enabled
+- [~] P0 `Order` domain model as an event-sourced aggregate (states: CREATED,
+      STOCK_RESERVED, PAYMENT_APPROVED, SHIPPED, COMPLETED, CANCELLED, FAILED) —
+      class/method skeleton in place (`domain/Order.java`, sealed `OrderDomainEvent`
+      hierarchy), state-machine logic left as TODOs to implement
+- [~] P0 Event store (`order_events` table) + `outbox` table — JPA entities,
+      repositories and `OrderEventStore`/`OutboxWriter` skeletons in place, core
+      logic left as TODOs
+- [~] P0 REST API: `POST /orders`, `GET /orders/{id}` — controller + DTOs
+      scaffolded, wiring left as TODOs
+- [~] P0 Publish `OrderCreated` via outbox + poller (@Scheduled) — `OutboxPublisher`
+      skeleton in place (`@Scheduled` wired, `@EnableScheduling` added), Avro
+      encode/decode + Kafka send left as TODOs
+- [~] P0 Saga orchestration: send commands (ReserveStockCommand, ProcessPaymentCommand,
+      CreateShipmentCommand) in reaction to received events — `OrderCommandService`
+      and `SagaCommandFactory` skeletons in place, orchestration logic left as TODOs
+- [~] P0 Listeners for StockReserved/StockRejected, PaymentApproved/PaymentDeclined,
+      ShipmentCreated/ShipmentFailed — listener classes scaffolded for all three
+      topics, dispatch logic left as TODOs
+- [~] P0 Compensation logic (cancellation, refund, stock release) — command methods
+      stubbed on `Order` and `OrderCommandService`, left as TODOs
 - [ ] P1 Idempotent event consumption (deduplication by eventId)
 - [ ] P1 Correlation ID (orderId) propagated via Kafka headers
 - [ ] P1 Integration tests with Testcontainers (Kafka + Postgres) — happy path and
       at least 1 compensation path
+
+Legend: `[~]` = scaffolded (package/class/method structure + docs + TODOs in place,
+compiles successfully) but business logic not yet implemented — being worked on
+collaboratively as a learning exercise before marking fully complete.
 
 ## Phase 3 — inventory-service
 - [ ] P0 Spring Boot 4 + Postgres setup (inventory_db)
