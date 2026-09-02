@@ -15,7 +15,8 @@ import org.apache.avro.specific.SpecificRecord;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -45,41 +46,79 @@ public class OutboxPublisher {
 
     private final OutboxRepository repository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final TransactionTemplate transactionTemplate;
 
-    public OutboxPublisher(OutboxRepository repository, KafkaTemplate<String, Object> kafkaTemplate) {
+    public OutboxPublisher(OutboxRepository repository, KafkaTemplate<String, Object> kafkaTemplate,
+                            PlatformTransactionManager transactionManager) {
         this.repository = repository;
         this.kafkaTemplate = kafkaTemplate;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /**
      * Runs on a fixed delay (configure via {@code application.properties},
      * e.g. {@code outbox.publisher.fixed-delay-ms}). Reads all pending
-     * rows, publishes each to Kafka (keyed by {@code aggregateId} so all
-     * messages for the same order stay ordered on the same partition), and
-     * marks them published.
+     * rows and attempts to publish each one, keyed by {@code aggregateId}
+     * so all messages for the same order stay ordered on the same
+     * partition.
      *
-     * <p>The send is performed synchronously (blocking on the returned
-     * {@code CompletableFuture} via {@code .join()}) so that a row is only
-     * marked {@code PUBLISHED} — and the transaction only committed — after
-     * Kafka has actually acknowledged it. If the send fails, the exception
-     * propagates, the transaction rolls back, and the row stays
-     * {@code PENDING} for the next poll to retry — this is what gives us
-     * at-least-once delivery instead of silently losing events on a
-     * transient Kafka error.
+     * <p>Deliberately NOT one big {@code @Transactional} method: each row
+     * is published inside its OWN transaction (see {@link #publishRow},
+     * run via {@link #transactionTemplate}). If publishing were wrapped in
+     * a single transaction spanning the whole loop, one failing row (e.g.
+     * a Schema Registry compatibility error) would roll back the DB
+     * changes for every row already successfully published earlier in the
+     * SAME loop iteration — but their Kafka sends already happened and
+     * can't be un-sent, so those rows would revert to {@code PENDING} and
+     * get needlessly re-published (a duplicate) on the next poll. Per-row
+     * transactions confine both the success and the failure to just that
+     * one row, and a failure for one row doesn't stop the rest of the
+     * batch from being attempted in the same poll.
+     *
+     * <p>A row that fails simply stays {@code PENDING} (its transaction
+     * never commits) and is retried on the next poll — see
+     * {@link #publishRow} for why the send itself is synchronous.
+     *
+     * <p>Caveat: this assumes a single instance of the poller runs at a
+     * time. If this service ever scales to multiple replicas, two
+     * instances could pick up and publish the same {@code PENDING} row in
+     * the same window (each still individually safe/at-least-once, but
+     * more duplicate-prone) — a {@code SELECT ... FOR UPDATE SKIP LOCKED}
+     * style read would be the fix, not implemented here. See
+     * docs/decisions.md.
      */
     @Scheduled(fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}")
-    @Transactional
     public void publishPending() {
         List<OutboxEntity> pending = repository.findByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING);
 
         for (OutboxEntity row : pending) {
-            SpecificRecord record = toAvroRecord(row.getEventType(), row.getPayload());
-            kafkaTemplate.send(row.getTopic(), row.getAggregateId().toString(), record).join();
-            row.markPublished(Instant.now());
-            repository.save(row);
-            log.info("Outbox: published {} for order {} to topic {}",
-                    row.getEventType(), row.getAggregateId(), row.getTopic());
+            try {
+                transactionTemplate.executeWithoutResult(status -> publishRow(row));
+            } catch (Exception e) {
+                log.error("Outbox: failed to publish {} for order {} to topic {} - will retry next poll",
+                        row.getEventType(), row.getAggregateId(), row.getTopic(), e);
+            }
         }
+    }
+
+    /**
+     * Publishes exactly one outbox row, within its own transaction (see
+     * {@link #publishPending}). The send is performed synchronously
+     * (blocking on the returned {@code CompletableFuture} via
+     * {@code .join()}) so that the row is only marked {@code PUBLISHED} —
+     * and this transaction only committed — after Kafka has actually
+     * acknowledged it. If the send throws, this transaction rolls back and
+     * the row stays {@code PENDING} — this is what gives us at-least-once
+     * delivery instead of silently losing events on a transient Kafka
+     * error.
+     */
+    private void publishRow(OutboxEntity row) {
+        SpecificRecord record = toAvroRecord(row.getEventType(), row.getPayload());
+        kafkaTemplate.send(row.getTopic(), row.getAggregateId().toString(), record).join();
+        row.markPublished(Instant.now());
+        repository.save(row);
+        log.info("Outbox: published {} for order {} to topic {}",
+                row.getEventType(), row.getAggregateId(), row.getTopic());
     }
 
     /**

@@ -76,12 +76,48 @@ correct mapping for JSON-sized text payloads. Also note Spring Boot 4 defaults t
 **Jackson 3** (`tools.jackson.databind.ObjectMapper`), not the classic Jackson 2.
 
 ## Phase 3 — inventory-service
-- [ ] P0 Spring Boot 4 + Postgres setup (inventory_db)
-- [ ] P0 Per-product stock model + initial seed endpoint
-- [ ] P0 `ReserveStockCommand` consumer → writes StockReserved/StockRejected to outbox
-- [ ] P0 `ReleaseStockCommand` consumer (compensation) → StockReleased
+- [x] P0 Spring Boot 4 + Postgres setup (inventory_db) — `server.port=8083`
+- [x] P0 Per-product stock model + initial seed endpoint — `POST /stock` (upsert),
+      `GET /stock/{productId}`; `stock` table keyed by natural `productId`, plus a
+      `stock_reservations` audit table keyed by (orderId, productId)
+- [x] P0 `ReserveStockCommand` consumer → writes StockReserved/StockRejected to outbox
+      — `InventoryCommandListener` + `InventoryCommandService` + `StockService`
+- [x] P0 `ReleaseStockCommand` consumer (compensation) → StockReleased
 - [ ] P1 Idempotent consumption
 - [ ] P1 Integration tests (Testcontainers)
+
+Manually verified end-to-end against order-service + the Phase 1 Docker Compose
+stack, both the happy path and the rejection path: `POST /orders` (with stock
+seeded below the requested quantity) results in inventory-service publishing
+`StockRejected`, order-service consuming it and transitioning the order to
+`CANCELLED`, and — confirmed via `GET /stock/{productId}` — the stock level is
+left completely unchanged (the in-transaction rollback described below works).
+The happy path (sufficient stock) correctly decrements `quantity_available` /
+increments `quantity_reserved` and results in order-service sending
+`ProcessPaymentCommand` next.
+
+Reservation is "all or nothing" per order: `StockService.tryReserveAll` reserves
+each line item via a single atomic conditional `UPDATE ... WHERE quantity_available
+>= :quantity` (see `StockRepository#tryReserve`), sorts items by `productId` first
+to avoid deadlocking against other orders reserving the same products concurrently,
+and — if any item can't be reserved — releases everything already reserved earlier
+in the same call, all within the one `@Transactional` method, so the transaction as
+a whole still commits (recording either `StockReserved` or `StockRejected` to the
+outbox) rather than rolling back and losing that record.
+
+Two more real bugs were found and fixed while testing this phase end-to-end
+(neither specific to inventory-service — both affect any topic/outbox in the
+project, so also relevant to Phases 4-5): (1) Kafka topics carrying more than one
+Avro record type (`order.events`, `inventory.commands`, `inventory.events`, and
+later `payment.*`/`shipping.*`) fail Schema Registry compatibility checks under the
+default `TopicNameStrategy`, once a second, structurally different event type is
+published to the same topic — fixed by switching producers to
+`RecordNameStrategy`; (2) `OutboxPublisher.publishPending()` originally wrapped the
+entire batch of pending rows in one `@Transactional` method — a failure partway
+through the batch rolled back rows that had ALREADY been sent to Kafka
+successfully, causing them to be re-published (duplicated) on the next poll; fixed
+by publishing each row in its own transaction via a programmatic
+`TransactionTemplate`. See `docs/decisions.md` for the full writeup of both.
 
 ## Phase 4 — payment-service
 - [ ] P0 Spring Boot 4 + Postgres setup (payment_db)

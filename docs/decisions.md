@@ -279,23 +279,222 @@ changes, update `TASKS.md` Phase 2 Block F and this note.
 
 ---
 
-## Cross-cutting notes for Phase 3+ (inventory-service and beyond)
+## Phase 3 — inventory-service
 
-Things established in Phase 2 that will likely recur:
+### Multi-type Kafka topics break Schema Registry compatibility checks under the default subject strategy
+This was discovered live, mid-testing: order-service's `OutboxPublisher`
+threw `SerializationException` / `RestClientException` (HTTP 409) the
+first time it ever tried to publish an `OrderCancelled` event —
+`Schema being registered is incompatible with an earlier schema for
+subject "order.events-value"`, with details `NAME_MISMATCH` (the record's
+`name` changed) and `READER_FIELD_MISSING_DEFAULT_VALUE` (the new
+`reason` field has no default).
 
-- Reuse the `Persistable<UUID>` pattern for any append-only or
-  app-assigned-id entity in inventory/payment/shipping-service.
+Root cause: the Confluent Avro serializer's default subject naming
+strategy is `TopicNameStrategy` — every message published to a given
+Kafka topic is registered under ONE subject, named `<topic>-value`
+(e.g. `order.events-value`), and the Schema Registry enforces
+compatibility (`BACKWARD` by default, checked via `GET /config`) between
+whatever gets registered there. That's the correct behavior for a topic
+that carries a single, evolving schema — but `order.events` was designed
+from Phase 2 onward to carry FOUR different, structurally unrelated
+record types (`OrderCreated`, `OrderCompleted`, `OrderCancelled`,
+`OrderFailed`) on the same topic. The bug had been latent since Phase 2:
+nothing caught it earlier because until inventory-service actually
+existed and could reply with `StockRejected`, order-service had only
+ever published `OrderCreated` — the first "second, different" event type
+published to `order.events` was what triggered it.
+
+This is not specific to `order.events` — the exact same problem applies
+to every other multi-type topic in the project: `inventory.commands`
+(`ReserveStockCommand`/`ReleaseStockCommand`), `inventory.events`
+(`StockReserved`/`StockRejected`/`StockReleased`), and — once
+payment-service/shipping-service exist — `payment.commands`,
+`payment.events`, `shipping.commands`, `shipping.events` too.
+
+**Fix:** switch the Avro serializer's subject naming strategy to
+`RecordNameStrategy`, which uses the Avro record's fully-qualified name
+(e.g. `com.fabioqmarsiaj.events.order.OrderCreated`) as the subject
+instead of the topic name — so every event type gets its own,
+independent subject and compatibility history, and different event types
+sharing a topic never get compared against each other:
+```properties
+spring.kafka.producer.properties.value.subject.name.strategy=io.confluent.kafka.serializers.subject.RecordNameStrategy
+```
+Only needs to be set on the **producer** side. Consumers never need it —
+`KafkaAvroDeserializer` resolves the writer schema directly by the
+numeric schema ID embedded in the Confluent wire format (magic byte + 4
+bytes), not by re-deriving a subject name. Applied to both
+`order-service` and `inventory-service`'s `application.properties`; will
+need to be applied to `payment-service`/`shipping-service` too once they
+exist.
+
+The old `order.events-value` subject (registered under the previous
+`TopicNameStrategy` behavior) was deliberately left in the Schema
+Registry rather than deleted — it's orphaned/unused going forward but
+harmless, and deleting subjects from a registry is a one-way,
+slightly-risky operation not worth doing for a local dev environment.
+
+### Outbox publisher: one transaction per row, not one per batch
+Found and fixed alongside the bug above, while investigating the same
+stack trace. `OutboxPublisher.publishPending()` originally wrapped the
+ENTIRE loop over all pending rows in a single `@Transactional` method:
+```java
+@Scheduled(...)
+@Transactional
+public void publishPending() {
+    for (OutboxEntity row : pending) {
+        kafkaTemplate.send(...).join();   // Kafka already has it
+        row.markPublished(...);
+        repository.save(row);             // not committed yet (same tx)
+    }
+}
+```
+If any row partway through the batch throws (exactly what happened with
+the `OrderCancelled` schema registration failure), Spring rolls back the
+WHOLE transaction — including the `markPublished`/`save` for every row
+earlier in that same loop iteration that had already been sent to Kafka
+successfully. Kafka sends can't be un-sent, so those earlier rows revert
+to `PENDING` in the database and get needlessly re-published (a
+duplicate) on the very next poll. The loop also aborts entirely on the
+first failure, so rows later in the same batch aren't even attempted
+until the next poll cycle.
+
+**Fix:** publish each row in its own, independent transaction, using a
+programmatically-created `TransactionTemplate` (injecting
+`PlatformTransactionManager` in the constructor) rather than the
+declarative `@Transactional` annotation on the whole method:
+```java
+public void publishPending() {                 // no @Transactional here
+    for (OutboxEntity row : pending) {
+        try {
+            transactionTemplate.executeWithoutResult(status -> publishRow(row));
+        } catch (Exception e) {
+            log.error("... will retry next poll", e);
+            // deliberately not rethrown: keep trying the rest of the batch
+        }
+    }
+}
+```
+A programmatic `TransactionTemplate` was necessary here (rather than just
+extracting a private `@Transactional` method) because Spring's
+`@Transactional` is implemented via a dynamic proxy wrapping the bean —
+calling an annotated method from another method on the SAME instance
+(`this.publishRow(row)`) bypasses the proxy entirely ("self-invocation"),
+so the annotation would silently do nothing. `TransactionTemplate` starts
+a real transaction directly, with no proxy involved, sidestepping that
+pitfall.
+
+Applied identically to both `order-service` and `inventory-service`'s
+`OutboxPublisher`.
+
+**Known limitation, not fixed:** this still assumes a single instance of
+the poller runs at a time. If a service is ever scaled to multiple
+replicas, two instances could both read and attempt to publish the same
+`PENDING` row within the same poll window — each individual publish is
+still safe (at-least-once), but duplicates become more likely. The fix
+for that would be reading pending rows with `SELECT ... FOR UPDATE SKIP
+LOCKED` so concurrent pollers naturally partition the work instead of
+racing over the same rows — not implemented, since this project only
+ever runs one instance of each service locally.
+
+### "All or nothing" multi-item stock reservation via atomic conditional UPDATE + in-transaction compensation
+`ReserveStockCommand` carries a list of line items (an order can request
+several different products at once), and the whole reservation attempt
+needs to succeed or fail as a unit — reserving 2 out of 3 items and
+silently dropping the third would corrupt the Saga's assumptions.
+
+Two design choices worth remembering here:
+1. **Atomic conditional UPDATE instead of optimistic locking.** Each
+   item is reserved via a single UPDATE with a `WHERE` guard:
+   `UPDATE stock SET quantity_available = quantity_available - :qty ...
+   WHERE product_id = :id AND quantity_available >= :qty` (see
+   `StockRepository#tryReserve`), checking the number of rows affected
+   (`0` = not enough stock) rather than reading the row, checking it in
+   Java, and writing it back (which would race against a concurrent
+   reservation for the same product). This was chosen over `@Version`
+   optimistic locking (used nowhere in this project so far) specifically
+   because it needs no retry loop: the database itself resolves the race
+   as part of the single UPDATE statement.
+2. **Items are reserved in a fixed order (sorted by `productId`) before
+   attempting anything**, in `StockService.tryReserveAll`. Since Saga
+   commands are Kafka-partitioned by `orderId` (not `productId`), two
+   different orders that both touch the same two products could
+   otherwise be processed concurrently by two different consumer
+   threads, each attempting their UPDATEs in whatever order their own
+   line items happen to be listed — a classic setup for a database
+   deadlock (thread A holds product X's row lock and wants product Y's;
+   thread B holds Y's and wants X's). Sorting first means every caller
+   always acquires row locks in the same global order.
+
+If any item in the sequence can't be reserved (returns `0` rows
+updated), every item already reserved earlier IN THAT SAME CALL is
+released again (`StockRepository#release`) — all still inside the one
+`@Transactional` `InventoryCommandService.handleReserveStock` method,
+rather than letting an exception propagate and trigger Spring's
+transaction rollback. This is deliberate: the method needs to still
+COMMIT either way, because it must record either `StockReserved` or
+`StockRejected` to the outbox in the same transaction as the reservation
+attempt's outcome — a rollback would silently discard that outbox row
+too, defeating the whole point of the Outbox pattern (the write and the
+"intent to publish" must succeed or fail together, and here "succeed"
+includes the rejection case).
+
+### `Persistable<String>` — the same pitfall, with a natural key instead of a UUID
+`StockEntity` is keyed by `productId` (a natural/business key like
+`"sku-123"`, supplied by the seed endpoint caller), not a randomly
+generated UUID — but the exact same Spring Data JPA pitfall documented
+for `order-service` in Phase 2 still applies: `productId` is never null
+the moment the entity is constructed, so Spring Data's default
+"is `@Id` null?" heuristic for `persist()` vs `merge()` still guesses
+wrong. `StockEntity implements Persistable<String>`, using the identical
+"`@Transient boolean isNew` flag set only in the brand-new-row
+constructor" technique as `order-service`'s `OutboxEntity` (see Phase 2
+section above) — confirming this pattern generalizes to any
+non-null-by-construction `@Id`, whatever its type or origin, not just
+app-generated UUIDs specifically.
+
+---
+
+## Cross-cutting notes for Phase 4+ (payment-service, shipping-service, and beyond)
+
+Things established in Phases 2-3 that will likely recur:
+
+- Reuse the `Persistable<UUID>` / `Persistable<String>` pattern for any
+  entity whose `@Id` is never null at construction time — whether an
+  app-assigned UUID or a natural/business key.
 - Reuse `columnDefinition = "TEXT"` instead of `@Lob` for any JSON string
   payload column on PostgreSQL.
 - Remember Jackson 3 (`tools.jackson.databind.ObjectMapper`) if any service
   needs to hand-serialize domain events to JSON like `OrderEventMapper` does.
 - Remember the Avro JSON codec (`EncoderFactory`/`DecoderFactory` +
   `SpecificDatumWriter`/`SpecificDatumReader`) if any service implements
-  its own outbox (inventory/payment/shipping-service all publish events —
-  `StockReserved`, `PaymentApproved`, `ShipmentCreated`, etc. — so they
-  likely need the same outbox infrastructure order-service has).
-- Decide up front whether inventory/payment/shipping-service's own Saga
-  replies (their `*.events` topics) should go through an outbox from the
-  start, given the known gap in order-service's Saga *commands* (see above).
+  its own outbox (payment/shipping-service both publish events —
+  `PaymentApproved`, `ShipmentCreated`, etc. — so they likely need the
+  same outbox infrastructure order-service and inventory-service have).
+- **Set `spring.kafka.producer.properties.value.subject.name.strategy=
+  io.confluent.kafka.serializers.subject.RecordNameStrategy` from the
+  START** for any service producing to a topic that carries more than one
+  event type (which is every `*.events`/`*.commands` topic in this
+  project) — don't wait to rediscover the Phase 3 Schema Registry bug
+  again.
+- **Give the outbox publisher one transaction per row, not one per
+  batch**, from the start (see Phase 3 section above) — copy
+  `order-service`/`inventory-service`'s `TransactionTemplate`-based
+  `OutboxPublisher` rather than the simpler single-`@Transactional`
+  version.
+- Decide up front whether payment/shipping-service's own Saga replies
+  (their `*.events` topics) should go through an outbox from the start,
+  given the known gap in order-service's Saga *commands* (see Phase 2
+  section above) — inventory-service and payment/shipping-service's
+  *events* already do use an outbox; only the orchestrator's outgoing
+  *commands* don't.
 - Pick a `server.port` for each new service before running multiple
-  services simultaneously outside Docker (order-service = 8082).
+  services simultaneously outside Docker (order-service = 8082,
+  inventory-service = 8083; payment-service and shipping-service should
+  take 8084 and 8085 respectively).
+- If a reservation/decrement-style operation needs "all or nothing"
+  semantics across multiple rows in one command (like inventory-service's
+  stock reservation), consider the atomic-conditional-UPDATE +
+  in-transaction-compensation pattern documented above rather than
+  optimistic locking with a retry loop.
