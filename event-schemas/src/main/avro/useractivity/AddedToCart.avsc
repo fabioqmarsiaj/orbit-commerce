@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "AddedToCart",
+  "namespace": "com.fabioqmarsiaj.events.useractivity",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "sessionId", "type": "string"},
+    {"name": "productId", "type": "string"},
+    {"name": "quantity", "type": "int"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

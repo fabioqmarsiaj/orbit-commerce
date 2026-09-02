@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "ProductViewed",
+  "namespace": "com.fabioqmarsiaj.events.useractivity",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "sessionId", "type": "string"},
+    {"name": "productId", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

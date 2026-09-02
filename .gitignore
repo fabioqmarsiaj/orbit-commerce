@@ -1,0 +1,42 @@
+# ---- Gradle / Java ----
+.gradle/
+**/build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+!gradle/wrapper/gradle-wrapper.jar
+HELP.md
+
+# ---- Go ----
+ingestion-service/bin/
+ingestion-service/*.exe
+ingestion-service/*.test
+ingestion-service/*.out
+
+# ---- IDEs ----
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated
+.springBeans
+.sts4-cache
+out/
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Docker volumes / local data ----
+.docker-data/
+
+# ---- Environment ----
+.env
+.env.local

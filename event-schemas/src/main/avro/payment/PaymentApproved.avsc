@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "PaymentApproved",
+  "namespace": "com.fabioqmarsiaj.events.payment",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "paymentId", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

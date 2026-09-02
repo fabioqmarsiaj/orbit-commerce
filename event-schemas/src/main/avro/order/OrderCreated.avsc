@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "OrderCreated",
+  "namespace": "com.fabioqmarsiaj.events.order",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "customerId", "type": "string"},
+    {"name": "items", "type": {"type": "array", "items": "com.fabioqmarsiaj.events.order.OrderLineItem"}},
+    {"name": "totalAmountCents", "type": "long"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

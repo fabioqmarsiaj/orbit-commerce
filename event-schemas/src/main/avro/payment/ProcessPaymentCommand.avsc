@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "ProcessPaymentCommand",
+  "namespace": "com.fabioqmarsiaj.events.payment",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "customerId", "type": "string"},
+    {"name": "amountCents", "type": "long"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

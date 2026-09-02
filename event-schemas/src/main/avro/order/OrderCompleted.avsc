@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "OrderCompleted",
+  "namespace": "com.fabioqmarsiaj.events.order",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

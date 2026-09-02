@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "OrderLineItem",
+  "namespace": "com.fabioqmarsiaj.events.order",
+  "fields": [
+    {"name": "productId", "type": "string"},
+    {"name": "quantity", "type": "int"},
+    {"name": "unitPriceCents", "type": "long"}
+  ]
+}

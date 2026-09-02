@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "ReserveStockCommand",
+  "namespace": "com.fabioqmarsiaj.events.inventory",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "items", "type": {"type": "array", "items": "com.fabioqmarsiaj.events.order.OrderLineItem"}},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

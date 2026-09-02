@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "StockReserved",
+  "namespace": "com.fabioqmarsiaj.events.inventory",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

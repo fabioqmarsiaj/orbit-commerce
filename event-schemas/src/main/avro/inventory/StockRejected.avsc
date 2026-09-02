@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "StockRejected",
+  "namespace": "com.fabioqmarsiaj.events.inventory",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "orderId", "type": "string"},
+    {"name": "reason", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}
