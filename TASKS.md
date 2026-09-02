@@ -3,15 +3,15 @@
 Legenda de prioridade: P0 (crítico/bloqueante) · P1 (essencial) · P2 (nice-to-have)
 
 ## Fase 0 — Scaffolding do repositório
-- [ ] P0 Criar estrutura de monorepo (Gradle multi-módulo + módulo Go separado)
-- [ ] P0 `settings.gradle.kts` com módulos: order-service, payment-service, inventory-service,
+- [x] P0 Criar estrutura de monorepo (Gradle multi-módulo + módulo Go separado)
+- [x] P0 `settings.gradle.kts` com módulos: order-service, payment-service, inventory-service,
       shipping-service, query-service, event-schemas
-- [ ] P0 Módulo `event-schemas`: schemas Avro (.avsc) para eventos/comandos de order, inventory,
+- [x] P0 Módulo `event-schemas`: schemas Avro (.avsc) para eventos/comandos de order, inventory,
       payment, shipping, user-activity
-- [ ] P0 Configurar plugin Avro no Gradle para geração de classes Java
-- [ ] P1 `go.mod` para ingestion-service, estrutura de pastas Go (cmd/, internal/)
-- [ ] P1 `.editorconfig`, `.gitignore` (Java + Go + Docker)
-- [ ] P2 README inicial com visão geral da arquitetura (placeholder)
+- [x] P0 Configurar plugin Avro no Gradle para geração de classes Java
+- [x] P1 `go.mod` para ingestion-service, estrutura de pastas Go (cmd/, internal/)
+- [x] P1 `.gitignore` (Java + Go + Docker) — `.editorconfig` pendente
+- [x] P2 README inicial com visão geral da arquitetura (placeholder)
 
 ## Fase 1 — Infraestrutura base (Docker Compose)
 - [ ] P0 `docker-compose.yml`: Kafka em modo KRaft (sem Zookeeper)
