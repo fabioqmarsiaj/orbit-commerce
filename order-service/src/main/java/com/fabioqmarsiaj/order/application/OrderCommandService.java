@@ -4,6 +4,7 @@ import com.fabioqmarsiaj.order.domain.Order;
 import com.fabioqmarsiaj.order.domain.OrderLineItem;
 import com.fabioqmarsiaj.order.messaging.KafkaTopics;
 import com.fabioqmarsiaj.order.messaging.SagaCommandFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -39,6 +40,7 @@ import java.util.UUID;
  * package's listeners), except {@link #createOrder}, which handles the
  * initial {@code POST /orders} API call.
  */
+@Slf4j
 @Service
 public class OrderCommandService {
 
@@ -70,6 +72,7 @@ public class OrderCommandService {
 
         kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
                 commandFactory.reserveStock(order));
+        log.info("Order {}: sent ReserveStockCommand to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
 
         return orderId;
     }
@@ -86,6 +89,7 @@ public class OrderCommandService {
 
         kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
                 commandFactory.processPayment(order));
+        log.info("Order {}: sent ProcessPaymentCommand to topic {}", orderId, KafkaTopics.PAYMENT_COMMANDS);
     }
 
     /**
@@ -113,6 +117,7 @@ public class OrderCommandService {
 
         kafkaTemplate.send(KafkaTopics.SHIPPING_COMMANDS, orderId.toString(),
                 commandFactory.createShipment(order));
+        log.info("Order {}: sent CreateShipmentCommand to topic {}", orderId, KafkaTopics.SHIPPING_COMMANDS);
     }
 
     /**
@@ -127,6 +132,7 @@ public class OrderCommandService {
 
         kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
                 commandFactory.releaseStock(order));
+        log.info("Order {}: sent ReleaseStockCommand (compensation) to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
     }
 
     /**
@@ -154,8 +160,11 @@ public class OrderCommandService {
 
         kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
                 commandFactory.refundPayment(order));
+        log.info("Order {}: sent RefundPaymentCommand (compensation) to topic {}", orderId, KafkaTopics.PAYMENT_COMMANDS);
+
         kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
                 commandFactory.releaseStock(order));
+        log.info("Order {}: sent ReleaseStockCommand (compensation) to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
     }
 
     /**
@@ -169,5 +178,6 @@ public class OrderCommandService {
         var events = order.pullPendingEvents();
         eventStore.append(order.getId(), events);
         outboxWriter.writeAll(order.getId(), events);
+        log.info("Order {}: persisted {} event(s) to order_events and outbox", order.getId(), events.size());
     }
 }

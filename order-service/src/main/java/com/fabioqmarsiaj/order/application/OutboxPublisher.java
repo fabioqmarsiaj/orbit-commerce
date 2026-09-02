@@ -7,6 +7,7 @@ import com.fabioqmarsiaj.events.order.OrderFailed;
 import com.fabioqmarsiaj.order.persistence.OutboxEntity;
 import com.fabioqmarsiaj.order.persistence.OutboxRepository;
 import com.fabioqmarsiaj.order.persistence.OutboxStatus;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.JsonDecoder;
 import org.apache.avro.specific.SpecificDatumReader;
@@ -38,6 +39,7 @@ import java.util.List;
  * {@link #toAvroRecord} for how {@code eventType} maps back to a Java
  * {@code Class}.
  */
+@Slf4j
 @Component
 public class OutboxPublisher {
 
@@ -75,6 +77,8 @@ public class OutboxPublisher {
             kafkaTemplate.send(row.getTopic(), row.getAggregateId().toString(), record).join();
             row.markPublished(Instant.now());
             repository.save(row);
+            log.info("Outbox: published {} for order {} to topic {}",
+                    row.getEventType(), row.getAggregateId(), row.getTopic());
         }
     }
 
