@@ -6,9 +6,16 @@ import com.fabioqmarsiaj.order.messaging.OrderEventTranslator;
 import com.fabioqmarsiaj.order.persistence.OutboxEntity;
 import com.fabioqmarsiaj.order.persistence.OutboxRepository;
 import com.fabioqmarsiaj.order.persistence.OutboxStatus;
+import org.apache.avro.io.EncoderFactory;
+import org.apache.avro.io.JsonEncoder;
+import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.avro.specific.SpecificRecord;
 import org.springframework.stereotype.Component;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -30,13 +37,12 @@ import java.util.UUID;
  * serialize the Avro {@link SpecificRecord} here. Avro-generated classes
  * expose a {@code getSchema()} bean-style getter returning
  * {@code org.apache.avro.Schema}, a complex object Jackson's default bean
- * introspection cannot cleanly serialize/deserialize. Instead, use Avro's
- * own JSON encoding support: {@link org.apache.avro.io.EncoderFactory#jsonEncoder}
- * with a {@link org.apache.avro.specific.SpecificDatumWriter}, writing into
- * a {@link java.io.ByteArrayOutputStream}. This is the same encoding
- * {@code OutboxPublisher} will later reverse with
- * {@link org.apache.avro.io.DecoderFactory#jsonDecoder} +
- * {@link org.apache.avro.specific.SpecificDatumReader}.
+ * introspection cannot cleanly serialize/deserialize. Instead, we use
+ * Avro's own JSON encoding support: {@link EncoderFactory#jsonEncoder} with
+ * a {@link SpecificDatumWriter}, writing into a
+ * {@link ByteArrayOutputStream}. This is the same encoding
+ * {@code OutboxPublisher} reverses with {@code DecoderFactory#jsonDecoder}
+ * + {@code SpecificDatumReader}.
  */
 @Component
 public class OutboxWriter {
@@ -57,16 +63,44 @@ public class OutboxWriter {
      * guarantee to hold.
      */
     public void writeAll(UUID orderId, List<OrderDomainEvent> events) {
-        // TODO: for each event in events:
-        //  1. Skip it if !translator.isPublishable(event).
-        //  2. SpecificRecord avroRecord = translator.toAvro(event);
-        //  3. Serialize avroRecord to an Avro-JSON string (see class javadoc
-        //     above for the exact API to use) — consider extracting this
-        //     into a small private helper, e.g.
-        //     `private String toAvroJson(SpecificRecord record)`.
-        //  4. Build a new OutboxEntity(UUID.randomUUID(), orderId,
-        //     KafkaTopics.ORDER_EVENTS, avroRecord.getClass().getSimpleName(),
-        //     json, OutboxStatus.PENDING, Instant.now()) and repository.save(...) it.
-        throw new UnsupportedOperationException("not implemented yet");
+        for (OrderDomainEvent event : events) {
+            if (!translator.isPublishable(event)) {
+                continue;
+            }
+
+            SpecificRecord avroRecord = translator.toAvro(event);
+            String json = toAvroJson(avroRecord);
+
+            OutboxEntity outboxEntity = new OutboxEntity(
+                    UUID.randomUUID(),
+                    orderId,
+                    KafkaTopics.ORDER_EVENTS,
+                    avroRecord.getClass().getSimpleName(),
+                    json,
+                    OutboxStatus.PENDING,
+                    Instant.now()
+            );
+            repository.save(outboxEntity);
+        }
+    }
+
+    /**
+     * Encodes an Avro {@link SpecificRecord} as a JSON string using Avro's
+     * own schema-aware JSON codec (see class javadoc for why this can't be
+     * plain Jackson).
+     */
+    @SuppressWarnings("unchecked")
+    private String toAvroJson(SpecificRecord record) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            JsonEncoder encoder = EncoderFactory.get().jsonEncoder(record.getSchema(), out);
+            SpecificDatumWriter<SpecificRecord> writer = new SpecificDatumWriter<>(record.getSchema());
+            writer.write(record, encoder);
+            encoder.flush();
+            return out.toString(StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                    "Failed to Avro-JSON encode " + record.getClass().getSimpleName(), e);
+        }
     }
 }

@@ -9,16 +9,22 @@ package com.fabioqmarsiaj.order.domain;
  */
 public record OrderLineItem(String productId, int quantity, long unitPriceCents) {
 
-    // TODO: add compact constructor validation, e.g.:
-    //  - quantity must be > 0
-    //  - unitPriceCents must be >= 0
-    //  - productId must not be blank
+    public OrderLineItem {
+        if (productId == null || productId.isBlank()) {
+            throw new IllegalArgumentException("productId must not be blank");
+        }
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("quantity must be greater than zero");
+        }
+        if (unitPriceCents < 0) {
+            throw new IllegalArgumentException("unitPriceCents must not be negative");
+        }
+    }
 
     /**
      * @return the subtotal for this line item (quantity * unitPriceCents).
      */
     public long subtotalCents() {
-        // TODO: implement
-        throw new UnsupportedOperationException("not implemented yet");
+        return (long) quantity * unitPriceCents;
     }
 }

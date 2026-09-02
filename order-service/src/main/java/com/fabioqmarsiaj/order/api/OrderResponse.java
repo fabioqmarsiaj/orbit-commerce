@@ -26,8 +26,12 @@ public record OrderResponse(
      * aggregate.
      */
     public static OrderResponse from(Order order) {
-        // TODO: map the corresponding getters on `order` into a new
-        //  OrderResponse instance.
-        throw new UnsupportedOperationException("not implemented yet");
+        return new OrderResponse(
+                order.getId(),
+                order.getCustomerId(),
+                order.getStatus(),
+                order.getItems(),
+                order.getTotalAmountCents()
+        );
     }
 }

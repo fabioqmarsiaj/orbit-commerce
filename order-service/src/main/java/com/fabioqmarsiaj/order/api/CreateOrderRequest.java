@@ -3,6 +3,8 @@ package com.fabioqmarsiaj.order.api;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 
 import java.util.List;
 
@@ -21,11 +23,8 @@ public record CreateOrderRequest(
      */
     public record LineItemRequest(
             @NotBlank String productId,
-            int quantity,
-            long unitPriceCents
+            @Positive int quantity,
+            @PositiveOrZero long unitPriceCents
     ) {
-        // TODO: consider adding @Positive on quantity and @PositiveOrZero
-        //  on unitPriceCents once you're comfortable with Bean Validation
-        //  constraints — for now these are left as a simple starting point.
     }
 }

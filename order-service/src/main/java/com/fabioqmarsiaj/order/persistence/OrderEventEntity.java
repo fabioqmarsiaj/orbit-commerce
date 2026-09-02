@@ -2,12 +2,10 @@ package com.fabioqmarsiaj.order.persistence;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
-import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import org.springframework.data.domain.Persistable;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -32,16 +30,27 @@ import java.util.UUID;
  * both believe they're appending sequence number 5 for the same order, the
  * database will reject the second insert instead of silently corrupting
  * the event stream.
+ *
+ * <p>This entity implements {@link Persistable} and always reports
+ * {@link #isNew()} as {@code true}. Without it, Spring Data JPA infers
+ * "new vs existing" purely from whether the {@code @Id} field is
+ * {@code null} — but here {@code id} is a UUID assigned by application
+ * code (via {@link java.util.UUID#randomUUID()}) BEFORE the entity is
+ * constructed, so it's never null. Without {@code Persistable}, Spring Data
+ * would wrongly treat every {@code save()} as updating an existing
+ * (detached) row via {@code merge()}, which fails with an
+ * {@code ObjectOptimisticLockingFailureException} since no such row
+ * actually exists yet. Since this table is append-only, "always new" is
+ * also simply the correct semantics.
  */
 @Entity
 @Table(
         name = "order_events",
         uniqueConstraints = @UniqueConstraint(columnNames = {"order_id", "sequence_number"})
 )
-public class OrderEventEntity {
+public class OrderEventEntity implements Persistable<UUID> {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
     @Column(name = "order_id", nullable = false)
@@ -53,8 +62,13 @@ public class OrderEventEntity {
     @Column(name = "event_type", nullable = false, length = 100)
     private String eventType;
 
-    @Lob
-    @Column(name = "payload", nullable = false)
+    // Deliberately NOT annotated with @Lob: on PostgreSQL, Hibernate maps a
+    // @Lob String to the "oid" large-object type, which requires the whole
+    // read to happen inside an active transaction (auto-commit reads throw
+    // "Large Objects may not be used in auto-commit mode"). Since payloads
+    // here are just JSON text of modest size, mapping directly to Postgres'
+    // native TEXT column type avoids that restriction entirely.
+    @Column(name = "payload", nullable = false, columnDefinition = "TEXT")
     private String payload;
 
     @Column(name = "occurred_at", nullable = false)
@@ -74,8 +88,14 @@ public class OrderEventEntity {
         this.occurredAt = occurredAt;
     }
 
+    @Override
     public UUID getId() {
         return id;
+    }
+
+    @Override
+    public boolean isNew() {
+        return true;
     }
 
     public UUID getOrderId() {

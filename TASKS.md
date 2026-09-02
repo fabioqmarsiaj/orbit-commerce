@@ -33,35 +33,47 @@ Schema Registry and Kafka UI reachable over HTTP, and a real produce/consume rou
 through `order.events` succeeded.
 
 ## Phase 2 — order-service (Saga core)
-- [x] P0 Spring Boot 4 setup (Java 21) — scaffolded; virtual threads not yet enabled
-- [~] P0 `Order` domain model as an event-sourced aggregate (states: CREATED,
+- [x] P0 Spring Boot 4 setup (Java 21) — virtual threads not yet enabled
+- [x] P0 `Order` domain model as an event-sourced aggregate (states: CREATED,
       STOCK_RESERVED, PAYMENT_APPROVED, SHIPPED, COMPLETED, CANCELLED, FAILED) —
-      class/method skeleton in place (`domain/Order.java`, sealed `OrderDomainEvent`
-      hierarchy), state-machine logic left as TODOs to implement
-- [~] P0 Event store (`order_events` table) + `outbox` table — JPA entities,
-      repositories and `OrderEventStore`/`OutboxWriter` skeletons in place, core
-      logic left as TODOs
-- [~] P0 REST API: `POST /orders`, `GET /orders/{id}` — controller + DTOs
-      scaffolded, wiring left as TODOs
-- [~] P0 Publish `OrderCreated` via outbox + poller (@Scheduled) — `OutboxPublisher`
-      skeleton in place (`@Scheduled` wired, `@EnableScheduling` added), Avro
-      encode/decode + Kafka send left as TODOs
-- [~] P0 Saga orchestration: send commands (ReserveStockCommand, ProcessPaymentCommand,
+      `domain/Order.java`, sealed `OrderDomainEvent` hierarchy, exhaustive
+      pattern-matching `apply()`, `create`/`rehydrate`/command methods implemented
+- [x] P0 Event store (`order_events` table) + `outbox` table — `OrderEventStore`,
+      `OrderEventMapper` (Jackson 3), `OutboxWriter`/`OutboxPublisher` (Avro JSON
+      codec) implemented; both entities implement `Persistable<UUID>` since ids are
+      assigned by application code, not the database
+- [x] P0 REST API: `POST /orders`, `GET /orders/{id}` — implemented and verified live
+      (curl/Invoke-RestMethod against a running instance)
+- [x] P0 Publish `OrderCreated` via outbox + poller (@Scheduled) — implemented and
+      verified: outbox row transitions PENDING -> PUBLISHED and the Avro message is
+      observable on `order.events` via the console consumer
+- [x] P0 Saga orchestration: send commands (ReserveStockCommand, ProcessPaymentCommand,
       CreateShipmentCommand) in reaction to received events — `OrderCommandService`
-      and `SagaCommandFactory` skeletons in place, orchestration logic left as TODOs
-- [~] P0 Listeners for StockReserved/StockRejected, PaymentApproved/PaymentDeclined,
-      ShipmentCreated/ShipmentFailed — listener classes scaffolded for all three
-      topics, dispatch logic left as TODOs
-- [~] P0 Compensation logic (cancellation, refund, stock release) — command methods
-      stubbed on `Order` and `OrderCommandService`, left as TODOs
+      + `SagaCommandFactory` implemented; verified `ReserveStockCommand` is published
+      to `inventory.commands` right after order creation
+- [x] P0 Listeners for StockReserved/StockRejected, PaymentApproved/PaymentDeclined,
+      ShipmentCreated/ShipmentFailed — implemented using class-level
+      `@KafkaListener` + method-level `@KafkaHandler` per topic (multi-type routing)
+- [x] P0 Compensation logic (cancellation, refund, stock release) — implemented on
+      both `Order` (raises OrderCancelled/OrderFailed) and `OrderCommandService`
+      (sends ReleaseStockCommand/RefundPaymentCommand); not yet exercised end-to-end
+      since inventory/payment/shipping-service don't exist until Phases 3-5
 - [ ] P1 Idempotent event consumption (deduplication by eventId)
 - [ ] P1 Correlation ID (orderId) propagated via Kafka headers
 - [ ] P1 Integration tests with Testcontainers (Kafka + Postgres) — happy path and
       at least 1 compensation path
 
-Legend: `[~]` = scaffolded (package/class/method structure + docs + TODOs in place,
-compiles successfully) but business logic not yet implemented — being worked on
-collaboratively as a learning exercise before marking fully complete.
+Manually verified end-to-end against the Phase 1 Docker Compose stack: `POST /orders`
+creates the aggregate, persists to `order_events` and `outbox` in one transaction,
+the outbox poller publishes the Avro-encoded `OrderCreated` to `order.events`, a
+`ReserveStockCommand` is sent to `inventory.commands`, and `GET /orders/{id}` correctly
+rehydrates and returns the aggregate. Two PostgreSQL/Hibernate pitfalls were found and
+fixed along the way: (1) entities with application-assigned UUID ids need
+`Persistable<UUID>` or Spring Data wrongly attempts `merge()`/UPDATE instead of
+`persist()`/INSERT; (2) `@Lob String` maps to PostgreSQL's `oid` large-object type,
+which fails outside an active transaction — plain `columnDefinition = "TEXT"` is the
+correct mapping for JSON-sized text payloads. Also note Spring Boot 4 defaults to
+**Jackson 3** (`tools.jackson.databind.ObjectMapper`), not the classic Jackson 2.
 
 ## Phase 3 — inventory-service
 - [ ] P0 Spring Boot 4 + Postgres setup (inventory_db)

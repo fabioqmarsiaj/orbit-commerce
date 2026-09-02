@@ -31,21 +31,21 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<CreateOrderResponse> createOrder(@Valid @RequestBody CreateOrderRequest request) {
-        // TODO:
-        //  1. Map request.items() (List<CreateOrderRequest.LineItemRequest>)
-        //     into List<OrderLineItem> (the domain value object).
-        //  2. UUID orderId = commandService.createOrder(request.customerId(), items);
-        //  3. Return ResponseEntity.status(HttpStatus.CREATED).body(new CreateOrderResponse(orderId));
-        throw new UnsupportedOperationException("not implemented yet");
+        List<OrderLineItem> items = request.items().stream()
+                .map(i -> new OrderLineItem(i.productId(), i.quantity(), i.unitPriceCents()))
+                .toList();
+
+        UUID orderId = commandService.createOrder(request.customerId(), items);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(new CreateOrderResponse(orderId));
     }
 
     @GetMapping("/{id}")
     public ResponseEntity<OrderResponse> getOrder(@PathVariable("id") UUID id) {
-        // TODO:
-        //  1. Order order = eventStore.load(id);
-        //  2. If order is null (no events found for this id), return
-        //     ResponseEntity.notFound().build().
-        //  3. Otherwise return ResponseEntity.ok(OrderResponse.from(order)).
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(id);
+        if (order == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(OrderResponse.from(order));
     }
 }

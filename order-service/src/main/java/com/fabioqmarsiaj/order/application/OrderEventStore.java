@@ -38,18 +38,19 @@ public class OrderEventStore {
      * through {@link Order#rehydrate}.
      *
      * @return the rebuilt order, or {@code null} if no events exist for
-     *         this id (consider returning an {@code Optional<Order>}
-     *         instead once you get to wiring this into
-     *         {@code OrderCommandService} — think about which is more
-     *         idiomatic here).
+     *         this id.
      */
     public Order load(UUID orderId) {
-        // TODO:
-        //  1. repository.findByOrderIdOrderBySequenceNumberAsc(orderId)
-        //  2. Map each OrderEventEntity -> OrderDomainEvent via
-        //     mapper.toDomainEvent(entity.getEventType(), entity.getPayload())
-        //  3. Order.rehydrate(...) the resulting list.
-        throw new UnsupportedOperationException("not implemented yet");
+        List<OrderEventEntity> entities = repository.findByOrderIdOrderBySequenceNumberAsc(orderId);
+        if (entities.isEmpty()) {
+            return null;
+        }
+
+        List<OrderDomainEvent> events = entities.stream()
+                .map(entity -> mapper.toDomainEvent(entity.getEventType(), entity.getPayload()))
+                .toList();
+
+        return Order.rehydrate(events);
     }
 
     /**
@@ -63,15 +64,19 @@ public class OrderEventStore {
      * what gives us the atomicity the Outbox pattern relies on.
      */
     public void append(UUID orderId, List<OrderDomainEvent> newEvents) {
-        // TODO:
-        //  1. Find how many events already exist for this order (hint:
-        //     repository.findByOrderIdOrderBySequenceNumberAsc(orderId).size(),
-        //     or add a dedicated count query to the repository if you'd
-        //     rather avoid loading full entities just to count them).
-        //  2. For each event in newEvents, in order, build an
-        //     OrderEventEntity (new UUID id, orderId, next sequence
-        //     number, mapper.toEventType(event), mapper.toPayload(event),
-        //     event.occurredAt()) and repository.save(...) it.
-        throw new UnsupportedOperationException("not implemented yet");
+        long nextSequenceNumber = repository.findByOrderIdOrderBySequenceNumberAsc(orderId).size();
+
+        for (OrderDomainEvent event : newEvents) {
+            OrderEventEntity entity = new OrderEventEntity(
+                    UUID.randomUUID(),
+                    orderId,
+                    nextSequenceNumber,
+                    mapper.toEventType(event),
+                    mapper.toPayload(event),
+                    event.occurredAt()
+            );
+            repository.save(entity);
+            nextSequenceNumber++;
+        }
     }
 }

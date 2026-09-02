@@ -64,17 +64,14 @@ public class OrderCommandService {
      */
     @Transactional
     public UUID createOrder(String customerId, List<OrderLineItem> items) {
-        // TODO:
-        //  1. UUID orderId = UUID.randomUUID();
-        //  2. Order order = Order.create(orderId, customerId, items);
-        //  3. persistAndPullEvents(order) — see helper below.
-        //  4. Send commandFactory.reserveStock(order) to
-        //     KafkaTopics.INVENTORY_COMMANDS via kafkaTemplate (think about
-        //     what key to use — the order id, as a String, is a sensible
-        //     partition key so all messages for one order land on the same
-        //     partition and stay ordered).
-        //  5. Return orderId.
-        throw new UnsupportedOperationException("not implemented yet");
+        UUID orderId = UUID.randomUUID();
+        Order order = Order.create(orderId, customerId, items);
+        persistAndPullEvents(order);
+
+        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
+                commandFactory.reserveStock(order));
+
+        return orderId;
     }
 
     /**
@@ -83,13 +80,12 @@ public class OrderCommandService {
      */
     @Transactional
     public void handleStockReserved(UUID orderId) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markStockReserved();
-        //  3. persistAndPullEvents(order);
-        //  4. Send commandFactory.processPayment(order) to
-        //     KafkaTopics.PAYMENT_COMMANDS.
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markStockReserved();
+        persistAndPullEvents(order);
+
+        kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
+                commandFactory.processPayment(order));
     }
 
     /**
@@ -99,12 +95,10 @@ public class OrderCommandService {
      */
     @Transactional
     public void handleStockRejected(UUID orderId, String reason) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markStockRejected(reason);
-        //  3. persistAndPullEvents(order);
-        //  (no outgoing command — the Saga ends here for this order)
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markStockRejected(reason);
+        persistAndPullEvents(order);
+        // No outgoing command — the Saga ends here for this order.
     }
 
     /**
@@ -113,13 +107,12 @@ public class OrderCommandService {
      */
     @Transactional
     public void handlePaymentApproved(UUID orderId, String paymentId) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markPaymentApproved(paymentId);
-        //  3. persistAndPullEvents(order);
-        //  4. Send commandFactory.createShipment(order) to
-        //     KafkaTopics.SHIPPING_COMMANDS.
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markPaymentApproved(paymentId);
+        persistAndPullEvents(order);
+
+        kafkaTemplate.send(KafkaTopics.SHIPPING_COMMANDS, orderId.toString(),
+                commandFactory.createShipment(order));
     }
 
     /**
@@ -128,13 +121,12 @@ public class OrderCommandService {
      */
     @Transactional
     public void handlePaymentDeclined(UUID orderId, String reason) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markPaymentDeclined(reason);
-        //  3. persistAndPullEvents(order);
-        //  4. Send commandFactory.releaseStock(order) to
-        //     KafkaTopics.INVENTORY_COMMANDS (compensation).
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markPaymentDeclined(reason);
+        persistAndPullEvents(order);
+
+        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
+                commandFactory.releaseStock(order));
     }
 
     /**
@@ -144,11 +136,9 @@ public class OrderCommandService {
      */
     @Transactional
     public void handleShipmentCreated(UUID orderId, String shipmentId) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markShipmentCreated(shipmentId);
-        //  3. persistAndPullEvents(order);
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markShipmentCreated(shipmentId);
+        persistAndPullEvents(order);
     }
 
     /**
@@ -158,29 +148,26 @@ public class OrderCommandService {
      */
     @Transactional
     public void handleShipmentFailed(UUID orderId, String reason) {
-        // TODO:
-        //  1. Order order = eventStore.load(orderId);
-        //  2. order.markShipmentFailed(reason);
-        //  3. persistAndPullEvents(order);
-        //  4. Send commandFactory.refundPayment(order) to
-        //     KafkaTopics.PAYMENT_COMMANDS (compensation).
-        //  5. Send commandFactory.releaseStock(order) to
-        //     KafkaTopics.INVENTORY_COMMANDS (compensation).
-        throw new UnsupportedOperationException("not implemented yet");
+        Order order = eventStore.load(orderId);
+        order.markShipmentFailed(reason);
+        persistAndPullEvents(order);
+
+        kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
+                commandFactory.refundPayment(order));
+        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
+                commandFactory.releaseStock(order));
     }
 
     /**
      * Shared helper: pulls whatever domain events the aggregate just
      * raised, and persists them to both the event store and the outbox.
-     * Every {@code handleXxx}/{@code createOrder} method above should call
-     * this exactly once, right after invoking a command method on the
+     * Every {@code handleXxx}/{@code createOrder} method above calls this
+     * exactly once, right after invoking a command method on the
      * aggregate.
      */
     private void persistAndPullEvents(Order order) {
-        // TODO:
-        //  1. var events = order.pullPendingEvents();
-        //  2. eventStore.append(order.getId(), events);
-        //  3. outboxWriter.writeAll(order.getId(), events);
-        throw new UnsupportedOperationException("not implemented yet");
+        var events = order.pullPendingEvents();
+        eventStore.append(order.getId(), events);
+        outboxWriter.writeAll(order.getId(), events);
     }
 }

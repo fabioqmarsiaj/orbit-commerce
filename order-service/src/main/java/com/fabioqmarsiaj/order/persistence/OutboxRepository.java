@@ -13,6 +13,5 @@ public interface OutboxRepository extends JpaRepository<OutboxEntity, UUID> {
      *         {@code Pageable}/limit parameter later to avoid pulling an
      *         unbounded number of rows in one poll cycle.
      */
-    // TODO: declare a derived query method, e.g.:
-    //  List<OutboxEntity> findByStatusOrderByCreatedAtAsc(OutboxStatus status);
+    List<OutboxEntity> findByStatusOrderByCreatedAtAsc(OutboxStatus status);
 }

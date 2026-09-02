@@ -1,14 +1,23 @@
 package com.fabioqmarsiaj.order.application;
 
+import com.fabioqmarsiaj.events.order.OrderCancelled;
+import com.fabioqmarsiaj.events.order.OrderCompleted;
+import com.fabioqmarsiaj.events.order.OrderCreated;
+import com.fabioqmarsiaj.events.order.OrderFailed;
 import com.fabioqmarsiaj.order.persistence.OutboxEntity;
 import com.fabioqmarsiaj.order.persistence.OutboxRepository;
 import com.fabioqmarsiaj.order.persistence.OutboxStatus;
+import org.apache.avro.io.DecoderFactory;
+import org.apache.avro.io.JsonDecoder;
+import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.specific.SpecificRecord;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.util.List;
 
@@ -46,42 +55,56 @@ public class OutboxPublisher {
      * rows, publishes each to Kafka (keyed by {@code aggregateId} so all
      * messages for the same order stay ordered on the same partition), and
      * marks them published.
+     *
+     * <p>The send is performed synchronously (blocking on the returned
+     * {@code CompletableFuture} via {@code .join()}) so that a row is only
+     * marked {@code PUBLISHED} — and the transaction only committed — after
+     * Kafka has actually acknowledged it. If the send fails, the exception
+     * propagates, the transaction rolls back, and the row stays
+     * {@code PENDING} for the next poll to retry — this is what gives us
+     * at-least-once delivery instead of silently losing events on a
+     * transient Kafka error.
      */
     @Scheduled(fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}")
     @Transactional
     public void publishPending() {
-        // TODO:
-        //  1. List<OutboxEntity> pending = repository.findByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING);
-        //     (implement that derived query method on OutboxRepository if
-        //     you haven't already, per its own TODO).
-        //  2. For each row:
-        //     a. SpecificRecord record = toAvroRecord(row.getEventType(), row.getPayload());
-        //     b. kafkaTemplate.send(row.getTopic(), row.getAggregateId().toString(), record);
-        //        (consider: should this be synchronous — .get() the Future
-        //        and only mark PUBLISHED on success — or fire-and-forget?
-        //        Think through what happens to at-least-once delivery in
-        //        each case, we'll discuss in review.)
-        //     c. row.markPublished(Instant.now());
-        //     d. repository.save(row);
-        throw new UnsupportedOperationException("not implemented yet");
+        List<OutboxEntity> pending = repository.findByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING);
+
+        for (OutboxEntity row : pending) {
+            SpecificRecord record = toAvroRecord(row.getEventType(), row.getPayload());
+            kafkaTemplate.send(row.getTopic(), row.getAggregateId().toString(), record).join();
+            row.markPublished(Instant.now());
+            repository.save(row);
+        }
     }
 
     /**
      * Reconstructs the exact Avro {@link SpecificRecord} instance from its
      * stored (eventType, Avro-JSON payload) pair, mirroring the encoding
      * {@code OutboxWriter} used to write it.
-     *
-     * <p>Use {@link org.apache.avro.io.DecoderFactory#jsonDecoder} with a
-     * {@link org.apache.avro.specific.SpecificDatumReader} configured with
-     * the right generated class's {@code SCHEMA$}, symmetrical to how
-     * {@code OutboxWriter} is expected to have encoded it.
      */
     private SpecificRecord toAvroRecord(String eventType, String payload) {
-        // TODO: implement a switch on eventType covering every Avro type
-        //  OrderEventTranslator#toAvro can produce (OrderCreated,
-        //  OrderCompleted, OrderCancelled, OrderFailed from the
-        //  com.fabioqmarsiaj.events.order package), decoding payload via
-        //  the Avro JSON decoder described above.
-        throw new UnsupportedOperationException("not implemented yet");
+        return switch (eventType) {
+            case "OrderCreated" -> decode(payload, OrderCreated.getClassSchema(), new SpecificDatumReader<OrderCreated>(OrderCreated.getClassSchema()));
+            case "OrderCompleted" -> decode(payload, OrderCompleted.getClassSchema(), new SpecificDatumReader<OrderCompleted>(OrderCompleted.getClassSchema()));
+            case "OrderCancelled" -> decode(payload, OrderCancelled.getClassSchema(), new SpecificDatumReader<OrderCancelled>(OrderCancelled.getClassSchema()));
+            case "OrderFailed" -> decode(payload, OrderFailed.getClassSchema(), new SpecificDatumReader<OrderFailed>(OrderFailed.getClassSchema()));
+            default -> throw new IllegalArgumentException("Unknown outbox event type: " + eventType);
+        };
+    }
+
+    /**
+     * Decodes an Avro-JSON payload back into a {@link SpecificRecord}
+     * using Avro's schema-aware JSON codec — the exact reverse of
+     * {@code OutboxWriter#toAvroJson}.
+     */
+    private <T extends SpecificRecord> T decode(String payload, org.apache.avro.Schema schema,
+                                                 SpecificDatumReader<T> reader) {
+        try {
+            JsonDecoder decoder = DecoderFactory.get().jsonDecoder(schema, payload);
+            return reader.read(null, decoder);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to Avro-JSON decode outbox payload", e);
+        }
     }
 }

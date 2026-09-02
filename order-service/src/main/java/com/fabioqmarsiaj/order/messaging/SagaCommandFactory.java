@@ -32,48 +32,56 @@ import java.util.UUID;
 public class SagaCommandFactory {
 
     public ReserveStockCommand reserveStock(Order order) {
-        // TODO: build a new ReserveStockCommand(eventId, orderId, items, occurredAt).
-        //  - eventId: UUID.randomUUID().toString()
-        //  - orderId: order.getId().toString()
-        //  - items: map order.getItems() (List<OrderLineItem>) to
-        //    List<com.fabioqmarsiaj.events.order.OrderLineItem>
-        //  - occurredAt: Instant.now()
-        throw new UnsupportedOperationException("not implemented yet");
+        return new ReserveStockCommand(
+                UUID.randomUUID().toString(),
+                order.getId().toString(),
+                toAvroLineItems(order.getItems()),
+                Instant.now());
     }
 
     public ReleaseStockCommand releaseStock(Order order) {
-        // TODO: same shape as reserveStock, but building a ReleaseStockCommand
-        //  (used for compensation when payment is declined or shipment fails).
-        throw new UnsupportedOperationException("not implemented yet");
+        return new ReleaseStockCommand(
+                UUID.randomUUID().toString(),
+                order.getId().toString(),
+                toAvroLineItems(order.getItems()),
+                Instant.now());
     }
 
     public ProcessPaymentCommand processPayment(Order order) {
-        // TODO: build a new ProcessPaymentCommand(eventId, orderId, customerId,
-        //  amountCents, occurredAt) using order.getCustomerId() and
-        //  order.getTotalAmountCents().
-        throw new UnsupportedOperationException("not implemented yet");
+        return new ProcessPaymentCommand(
+                UUID.randomUUID().toString(),
+                order.getId().toString(),
+                order.getCustomerId(),
+                order.getTotalAmountCents(),
+                Instant.now());
     }
 
     public RefundPaymentCommand refundPayment(Order order) {
-        // TODO: build a new RefundPaymentCommand(eventId, orderId, amountCents,
-        //  occurredAt) — used for compensation when the shipment fails after
-        //  payment was already approved.
-        throw new UnsupportedOperationException("not implemented yet");
+        return new RefundPaymentCommand(
+                UUID.randomUUID().toString(),
+                order.getId().toString(),
+                order.getTotalAmountCents(),
+                Instant.now());
     }
 
     public CreateShipmentCommand createShipment(Order order) {
-        // TODO: build a new CreateShipmentCommand(eventId, orderId, customerId,
-        //  occurredAt).
-        throw new UnsupportedOperationException("not implemented yet");
+        return new CreateShipmentCommand(
+                UUID.randomUUID().toString(),
+                order.getId().toString(),
+                order.getCustomerId(),
+                Instant.now());
     }
 
     /**
      * Shared helper to convert domain-model line items to their Avro
      * equivalent — same conversion needed in {@link OrderEventTranslator},
-     * consider whether this duplication is worth extracting to a common
-     * place once both are implemented.
+     * kept duplicated for now since both classes are small and independent;
+     * worth extracting to a common place if a third use case appears.
      */
     private List<com.fabioqmarsiaj.events.order.OrderLineItem> toAvroLineItems(List<OrderLineItem> items) {
-        throw new UnsupportedOperationException("not implemented yet");
+        return items.stream()
+                .map(i -> new com.fabioqmarsiaj.events.order.OrderLineItem(
+                        i.productId(), i.quantity(), i.unitPriceCents()))
+                .toList();
     }
 }

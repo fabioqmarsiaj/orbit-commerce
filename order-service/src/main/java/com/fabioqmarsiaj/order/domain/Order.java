@@ -78,13 +78,24 @@ public class Order {
      * @return a new {@code Order} instance with one pending event
      */
     public static Order create(UUID orderId, String customerId, List<OrderLineItem> items) {
-        // TODO:
-        //  1. Validate inputs (e.g. items must not be empty).
-        //  2. Compute totalAmountCents from the items.
-        //  3. Instantiate an Order, then raise() an OrderCreated event with
-        //     a freshly generated eventId and Instant.now().
-        //  4. Return the order.
-        throw new UnsupportedOperationException("not implemented yet");
+        if (items == null || items.isEmpty()) {
+            throw new IllegalArgumentException("An order must have at least one line item");
+        }
+
+        long totalAmountCents = items.stream()
+                .mapToLong(OrderLineItem::subtotalCents)
+                .sum();
+
+        Order order = new Order();
+        order.raise(new OrderCreated(
+                UUID.randomUUID(),
+                orderId,
+                Instant.now(),
+                customerId,
+                items,
+                totalAmountCents
+        ));
+        return order;
     }
 
     /**
@@ -92,8 +103,8 @@ public class Order {
      * Only valid while the order is in {@link OrderStatus#CREATED}.
      */
     public void markStockReserved() {
-        // TODO: validate current status, then raise(new StockReserved(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.CREATED, "reserve stock");
+        raise(new StockReserved(UUID.randomUUID(), id, Instant.now()));
     }
 
     /**
@@ -102,9 +113,9 @@ public class Order {
      * {@link OrderStatus#CANCELLED}.
      */
     public void markStockRejected(String reason) {
-        // TODO: validate current status, then raise(new StockRejected(...))
-        //  followed by raise(new OrderCancelled(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.CREATED, "reject stock");
+        raise(new StockRejected(UUID.randomUUID(), id, Instant.now(), reason));
+        raise(new OrderCancelled(UUID.randomUUID(), id, Instant.now(), reason));
     }
 
     /**
@@ -112,8 +123,8 @@ public class Order {
      * the order is in {@link OrderStatus#STOCK_RESERVED}.
      */
     public void markPaymentApproved(String paymentId) {
-        // TODO: validate current status, then raise(new PaymentApproved(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.STOCK_RESERVED, "approve payment");
+        raise(new PaymentApproved(UUID.randomUUID(), id, Instant.now(), paymentId));
     }
 
     /**
@@ -123,9 +134,9 @@ public class Order {
      * ReleaseStockCommand as part of the same reaction).
      */
     public void markPaymentDeclined(String reason) {
-        // TODO: validate current status, then raise(new PaymentDeclined(...))
-        //  followed by raise(new OrderCancelled(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.STOCK_RESERVED, "decline payment");
+        raise(new PaymentDeclined(UUID.randomUUID(), id, Instant.now(), reason));
+        raise(new OrderCancelled(UUID.randomUUID(), id, Instant.now(), reason));
     }
 
     /**
@@ -134,9 +145,9 @@ public class Order {
      * have had payment approved beforehand.
      */
     public void markShipmentCreated(String shipmentId) {
-        // TODO: validate current status, then raise(new ShipmentCreated(...))
-        //  followed by raise(new OrderCompleted(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.PAYMENT_APPROVED, "create shipment");
+        raise(new ShipmentCreated(UUID.randomUUID(), id, Instant.now(), shipmentId));
+        raise(new OrderCompleted(UUID.randomUUID(), id, Instant.now()));
     }
 
     /**
@@ -146,9 +157,24 @@ public class Order {
      * responsible for issuing RefundPaymentCommand + ReleaseStockCommand).
      */
     public void markShipmentFailed(String reason) {
-        // TODO: validate current status, then raise(new ShipmentFailed(...))
-        //  followed by raise(new OrderFailed(...)).
-        throw new UnsupportedOperationException("not implemented yet");
+        requireStatus(OrderStatus.PAYMENT_APPROVED, "fail shipment");
+        raise(new ShipmentFailed(UUID.randomUUID(), id, Instant.now(), reason));
+        raise(new OrderFailed(UUID.randomUUID(), id, Instant.now(), reason));
+    }
+
+    /**
+     * Guards a command method against being invoked while the aggregate is
+     * not in the expected state (e.g. calling {@link #markPaymentApproved}
+     * on an order that was already cancelled). Centralizing this check
+     * keeps every command method above focused on "what event to raise"
+     * rather than repeating the same validation boilerplate.
+     */
+    private void requireStatus(OrderStatus expected, String action) {
+        if (this.status != expected) {
+            throw new IllegalStateException(
+                    "Cannot %s for order %s: expected status %s but was %s"
+                            .formatted(action, id, expected, status));
+        }
     }
 
     // ---------------------------------------------------------------
@@ -166,14 +192,15 @@ public class Order {
      * @return the order in its current state
      */
     public static Order rehydrate(List<OrderDomainEvent> history) {
-        // TODO:
-        //  1. Guard against an empty history (should never happen).
-        //  2. Create an empty Order instance.
-        //  3. For each event in history, call apply(event) directly
-        //     (do NOT call raise() — these events are already persisted,
-        //     we must not re-add them to pendingEvents).
-        //  4. Return the order.
-        throw new UnsupportedOperationException("not implemented yet");
+        if (history == null || history.isEmpty()) {
+            throw new IllegalArgumentException("Cannot rehydrate an order from empty history");
+        }
+
+        Order order = new Order();
+        for (OrderDomainEvent event : history) {
+            order.apply(event);
+        }
+        return order;
     }
 
     /**
@@ -188,41 +215,34 @@ public class Order {
 
     /**
      * The single source of truth for how each event type mutates aggregate
-     * state. Implement this using an exhaustive Java 21 pattern-matching
+     * state. Implemented using an exhaustive Java 21 pattern-matching
      * {@code switch} over the sealed {@link OrderDomainEvent} interface —
-     * the compiler will error if a new event type is added to the sealed
+     * the compiler errors if a new event type is added to the sealed
      * interface but not handled here.
      *
-     * <p>This method must have NO side effects beyond mutating {@code this}
-     * (no validation, no exceptions for "invalid" states, no I/O) since it
-     * is reused by both {@link #raise} and {@link #rehydrate}.
+     * <p>This method has NO side effects beyond mutating {@code this} (no
+     * validation, no exceptions for "invalid" states, no I/O) since it is
+     * reused by both {@link #raise} and {@link #rehydrate}.
      */
     private void apply(OrderDomainEvent event) {
-        // TODO: implement with a pattern-matching switch, e.g.:
-        //
-        // switch (event) {
-        //     case OrderCreated e -> {
-        //         this.id = e.orderId();
-        //         this.customerId = e.customerId();
-        //         this.items = e.items();
-        //         this.totalAmountCents = e.totalAmountCents();
-        //         this.status = OrderStatus.CREATED;
-        //     }
-        //     case StockReserved e -> this.status = OrderStatus.STOCK_RESERVED;
-        //     case StockRejected e -> { /* no field change beyond status, handled by OrderCancelled */ }
-        //     case PaymentApproved e -> this.status = OrderStatus.PAYMENT_APPROVED;
-        //     case PaymentDeclined e -> { /* no field change beyond status, handled by OrderCancelled */ }
-        //     case ShipmentCreated e -> this.status = OrderStatus.SHIPPED;
-        //     case ShipmentFailed e -> { /* no field change beyond status, handled by OrderFailed */ }
-        //     case OrderCancelled e -> this.status = OrderStatus.CANCELLED;
-        //     case OrderCompleted e -> this.status = OrderStatus.COMPLETED;
-        //     case OrderFailed e -> this.status = OrderStatus.FAILED;
-        // }
-        //
-        // Fill in the real logic below (the sketch above is a starting
-        // point, not the final answer — double check status transitions
-        // against the OrderStatus javadoc diagram).
-        throw new UnsupportedOperationException("not implemented yet");
+        switch (event) {
+            case OrderCreated e -> {
+                this.id = e.orderId();
+                this.customerId = e.customerId();
+                this.items = e.items();
+                this.totalAmountCents = e.totalAmountCents();
+                this.status = OrderStatus.CREATED;
+            }
+            case StockReserved e -> this.status = OrderStatus.STOCK_RESERVED;
+            case StockRejected e -> { /* no field change beyond status, handled by OrderCancelled */ }
+            case PaymentApproved e -> this.status = OrderStatus.PAYMENT_APPROVED;
+            case PaymentDeclined e -> { /* no field change beyond status, handled by OrderCancelled */ }
+            case ShipmentCreated e -> this.status = OrderStatus.SHIPPED;
+            case ShipmentFailed e -> { /* no field change beyond status, handled by OrderFailed */ }
+            case OrderCancelled e -> this.status = OrderStatus.CANCELLED;
+            case OrderCompleted e -> this.status = OrderStatus.COMPLETED;
+            case OrderFailed e -> this.status = OrderStatus.FAILED;
+        }
     }
 
     /**
@@ -232,9 +252,9 @@ public class Order {
      * store + outbox.
      */
     public List<OrderDomainEvent> pullPendingEvents() {
-        // TODO: copy pendingEvents to a new unmodifiable list, clear the
-        //  internal list, and return the copy.
-        throw new UnsupportedOperationException("not implemented yet");
+        List<OrderDomainEvent> copy = List.copyOf(pendingEvents);
+        pendingEvents.clear();
+        return copy;
     }
 
     // ---------------------------------------------------------------

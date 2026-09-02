@@ -50,38 +50,35 @@ public class OrderEventTranslator {
      *         {@code order.events}.
      */
     public boolean isPublishable(OrderDomainEvent event) {
-        // TODO: return true only for OrderCreated / OrderCompleted /
-        //  OrderCancelled / OrderFailed instances (e.g. via `instanceof`
-        //  checks, or a pattern-matching switch with a default branch).
-        throw new UnsupportedOperationException("not implemented yet");
+        return event instanceof OrderCreated
+                || event instanceof OrderCompleted
+                || event instanceof OrderCancelled
+                || event instanceof OrderFailed;
     }
 
     /**
      * Converts a publishable domain event into its Avro wire-format
      * equivalent. Callers must check {@link #isPublishable} first — this
-     * method should throw for any other event type.
+     * method throws for any other event type.
      */
     public SpecificRecord toAvro(OrderDomainEvent event) {
-        // TODO: implement a pattern-matching switch, e.g.:
-        //
-        // return switch (event) {
-        //     case OrderCreated e -> new com.fabioqmarsiaj.events.order.OrderCreated(
-        //             e.eventId().toString(),
-        //             e.orderId().toString(),
-        //             e.customerId(),
-        //             toAvroLineItems(e.items()),
-        //             e.totalAmountCents(),
-        //             e.occurredAt());
-        //     case OrderCompleted e -> new com.fabioqmarsiaj.events.order.OrderCompleted(
-        //             e.eventId().toString(), e.orderId().toString(), e.occurredAt());
-        //     case OrderCancelled e -> new com.fabioqmarsiaj.events.order.OrderCancelled(
-        //             e.eventId().toString(), e.orderId().toString(), e.reason(), e.occurredAt());
-        //     case OrderFailed e -> new com.fabioqmarsiaj.events.order.OrderFailed(
-        //             e.eventId().toString(), e.orderId().toString(), e.reason(), e.occurredAt());
-        //     default -> throw new IllegalArgumentException(
-        //             "Event type is not publishable to order.events: " + event.getClass());
-        // };
-        throw new UnsupportedOperationException("not implemented yet");
+        return switch (event) {
+            case OrderCreated e -> new com.fabioqmarsiaj.events.order.OrderCreated(
+                    e.eventId().toString(),
+                    e.orderId().toString(),
+                    e.customerId(),
+                    toAvroLineItems(e.items()),
+                    e.totalAmountCents(),
+                    e.occurredAt());
+            case OrderCompleted e -> new com.fabioqmarsiaj.events.order.OrderCompleted(
+                    e.eventId().toString(), e.orderId().toString(), e.occurredAt());
+            case OrderCancelled e -> new com.fabioqmarsiaj.events.order.OrderCancelled(
+                    e.eventId().toString(), e.orderId().toString(), e.reason(), e.occurredAt());
+            case OrderFailed e -> new com.fabioqmarsiaj.events.order.OrderFailed(
+                    e.eventId().toString(), e.orderId().toString(), e.reason(), e.occurredAt());
+            default -> throw new IllegalArgumentException(
+                    "Event type is not publishable to order.events: " + event.getClass());
+        };
     }
 
     /**
@@ -89,10 +86,9 @@ public class OrderEventTranslator {
      * building an Avro {@code OrderCreated} record.
      */
     private List<com.fabioqmarsiaj.events.order.OrderLineItem> toAvroLineItems(List<OrderLineItem> items) {
-        // TODO: items.stream()
-        //  .map(i -> new com.fabioqmarsiaj.events.order.OrderLineItem(
-        //          i.productId(), i.quantity(), i.unitPriceCents()))
-        //  .toList();
-        throw new UnsupportedOperationException("not implemented yet");
+        return items.stream()
+                .map(i -> new com.fabioqmarsiaj.events.order.OrderLineItem(
+                        i.productId(), i.quantity(), i.unitPriceCents()))
+                .toList();
     }
 }
