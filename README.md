@@ -25,12 +25,44 @@ See [TASKS.md](./TASKS.md) for the full implementation plan and progress.
 
 ## Status
 
-Project scaffolding (Phase 0) — module structure, build tooling, and shared
-Avro schemas are in place. Business logic implementation starts in Phase 1.
+Phases 0 and 1 are complete: module scaffolding, build tooling, shared Avro
+schemas, and the local Docker Compose infrastructure (Kafka, Schema Registry,
+Postgres, Kafka UI) are all in place and validated. Business logic
+implementation starts in Phase 2.
 
 ## Development
 
-Requires: JDK 21, Docker.
+Requires: JDK 21, Docker Desktop (with Compose v2), Go 1.22+.
+
+### Local infrastructure
+
+```powershell
+# Bring up Kafka (KRaft), Schema Registry, Postgres, and Kafka UI
+.\scripts\env-up.ps1
+
+# Tail logs (optionally for a single service, e.g. -Service broker)
+.\scripts\env-logs.ps1
+
+# Tear down (add -Volumes to also wipe data)
+.\scripts\env-down.ps1
+```
+
+Once up, the following are available:
+
+| Service | URL / Address |
+|---|---|
+| Kafka broker | `localhost:9092` |
+| Schema Registry | http://localhost:8081 |
+| Kafka UI | http://localhost:8080 |
+| Postgres | `localhost:5432` (user/password: `orbit` / `orbit`) |
+
+Kafka topics (`order.events`, `inventory.commands`, `inventory.events`,
+`payment.commands`, `payment.events`, `shipping.commands`, `shipping.events`,
+`user-activity.events`) and the five per-service Postgres databases
+(`order_db`, `payment_db`, `inventory_db`, `shipping_db`, `query_db`) are
+created automatically on first startup.
+
+### Building the code
 
 ```powershell
 # Build all Java/Gradle modules

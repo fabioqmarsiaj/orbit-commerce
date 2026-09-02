@@ -14,16 +14,23 @@ Priority legend: P0 (critical/blocking) · P1 (essential) · P2 (nice-to-have)
 - [x] P2 Initial README with architecture overview (placeholder)
 
 ## Phase 1 — Base infrastructure (Docker Compose)
-- [ ] P0 `docker-compose.yml`: Kafka in KRaft mode (no Zookeeper)
-- [ ] P0 Confluent Schema Registry
-- [ ] P0 Single Postgres instance + init script creating DBs: order_db, payment_db,
-      inventory_db, shipping_db, query_db
-- [ ] P1 Kafka UI (Provectus) for topic/schema inspection
-- [ ] P1 Kafka topic creation via init script (order.events, inventory.commands,
+- [x] P0 `docker-compose.yml`: Kafka in KRaft mode (no Zookeeper) — `apache/kafka:4.3.1`,
+      combined broker+controller node
+- [x] P0 Confluent Schema Registry — `confluentinc/cp-schema-registry:7.6.13`
+- [x] P0 Single Postgres instance + init script creating DBs: order_db, payment_db,
+      inventory_db, shipping_db, query_db — `postgres:16-alpine`
+- [x] P1 Kafka UI for topic/schema inspection — `kafbat/kafka-ui:latest` (actively maintained
+      community fork; the original `provectuslabs/kafka-ui` has been unmaintained for 2+ years)
+- [x] P1 Kafka topic creation via init script (order.events, inventory.commands,
       inventory.events, payment.commands, payment.events, shipping.commands, shipping.events,
-      user-activity.events)
-- [ ] P2 Prometheus + Grafana + kafka-exporter (can be deferred to Phase 8)
-- [ ] P1 `Makefile` or PowerShell scripts to bring the local environment up/down
+      user-activity.events) — one-shot `kafka-init` container running `infra/kafka/init-topics.sh`
+- [ ] P2 Prometheus + Grafana + kafka-exporter (deferred to Phase 9)
+- [x] P1 PowerShell scripts (`scripts/env-up.ps1`, `env-down.ps1`, `env-logs.ps1`) to bring the
+      local environment up/down
+
+Validated end-to-end: broker healthy, all 8 topics created, 5 Postgres databases created,
+Schema Registry and Kafka UI reachable over HTTP, and a real produce/consume round-trip
+through `order.events` succeeded.
 
 ## Phase 2 — order-service (Saga core)
 - [ ] P0 Spring Boot 4 setup (Java 21, virtual threads enabled)
