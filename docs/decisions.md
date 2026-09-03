@@ -1026,6 +1026,112 @@ follow-up entry below once Part B lands.
 
 ---
 
+## Phase 7 — query-service (Part B: Kafka Streams analytics)
+
+### No Spring Boot Kafka Streams starter needed — `spring-boot-starter-kafka` already brings it
+Before writing any topology code, it's worth recording what was
+confirmed by inspecting the actual dependency jars (not assumed from
+memory/tutorials, which mostly predate Spring Boot 4's package
+reorganization): `spring-boot-starter-kafka` (already a dependency of
+every service in this project, including query-service) transitively
+pulls in `spring-kafka`, which already provides `@EnableKafkaStreams`,
+`KafkaStreamsConfiguration`, and `StreamsBuilderFactoryBean` — no
+additional `spring-kafka` dependency needed. More surprisingly, Spring
+Boot's own `spring-boot-kafka` autoconfiguration module
+(`org.springframework.boot.kafka.autoconfigure.KafkaStreamsAnnotationDrivenConfiguration`)
+is *conditionally* active too: it's `@ConditionalOnBean(name =
+"defaultKafkaStreamsBuilder")` — the exact bean name
+`@EnableKafkaStreams` registers — and, once active, automatically builds
+the required `KafkaStreamsConfiguration` bean by reading
+`spring.kafka.streams.*` properties (`application-id`, and everything
+under `spring.kafka.streams.properties.*` as raw Kafka Streams config).
+This means the ONLY code needed to wire up Kafka Streams here is
+`@Configuration @EnableKafkaStreams` on one class — no manual `new
+KafkaStreamsConfiguration(Map.of(...))` bean, unlike what most
+older/pre-Spring-Boot-4 Kafka Streams tutorials show. Only
+`io.confluent:kafka-streams-avro-serde:7.6.13` needed to be added as a
+new dependency (same version already used for `kafka-avro-serializer`
+everywhere else in this project — confirmed to exist in the Confluent
+Maven repo before using it).
+
+### `user-activity.events` read as `GenericRecord`, filtered by schema name — not `SpecificAvroSerde`
+Same multi-type-topic shape as every other topic in this project:
+`user-activity.events` carries three unrelated Avro types
+(`ProductViewed`/`AddedToCart`/`SearchPerformed`). A Kafka Streams
+topology's default value serde has to be ONE serde for the whole
+topology, so `SpecificAvroSerde<ProductViewed>` isn't an option here the
+way a per-message-type `@KafkaHandler` is for `@KafkaListener`-based
+consumers. Instead, the default value serde is Confluent's
+`GenericAvroSerde` (schema-aware, but deserializes into a generic
+`org.apache.avro.generic.GenericRecord` rather than a specific generated
+class), and the topology's first step filters down to just
+`ProductViewed` by checking `record.getSchema().getName()` — the
+Kafka-Streams-side equivalent of the `eventType` discriminator string
+pattern used everywhere else in this project (outbox rows,
+order-service's event store, this same service's own
+`timeline_entries` table from Part A).
+
+### Interactive query: current window only, via `StreamsBuilderFactoryBean` + `ReadOnlyWindowStore`
+`GET /analytics/top-products` queries ONLY the current (most recent,
+still-open) 1-minute tumbling window — the more literal reading of
+TASKS.md's wording ("tumbling window (1 min) ... count via state
+store"), simpler than summing several recent windows, and consistent
+with treating this as a lightweight, best-effort analytics feature
+rather than a precise historical report. `TopProductsQueryService`
+injects the `StreamsBuilderFactoryBean` (the same bean
+`@EnableKafkaStreams` registers), pulls the live `KafkaStreams` instance
+out of it, and queries the named `product-view-counts` state store via
+`KafkaStreams#store(...)` + `ReadOnlyWindowStore#fetchAll(windowStart,
+windowEnd)` — the window boundaries are computed by truncating "now"
+down to the configured window size, mirroring exactly how Kafka Streams
+itself assigns records to tumbling windows. Returns an empty list if the
+store isn't ready yet or nothing has been counted in the current window
+— expected/normal state until ingestion-service (Phase 8) actually
+produces `ProductViewed` traffic, not a bug.
+
+### Bug found via query-service's own test suite: Kafka Streams needs its source topic to already exist, unlike `@KafkaListener`
+This is the one part of Part B that was actually manually verified
+(indirectly) before Phase 8 exists: re-running query-service's existing
+`ApplicationTests` (unchanged, still just `contextLoads()`) after adding
+the Streams topology revealed a real difference in failure behavior
+between `@KafkaListener`-based consumers and Kafka Streams. Every other
+consumer in this project (all the `@KafkaListener` classes across every
+service) tolerates a topic not existing yet — it just waits/retries. A
+Kafka Streams topology does NOT: with `allow.auto.create.topics=false`
+(the correct, deliberate setting used everywhere in this project — see
+earlier phases), a topology whose SOURCE topic doesn't exist throws
+`MissingSourceTopicException` and leaves the entire `StreamThread`
+**permanently** in the `ERROR` state — not a transient condition that
+resolves once the topic is created later, unlike what the log's own
+wording ("a new rebalance will be kicked off automatically") suggests
+happens for other kinds of missing-metadata issues. This surfaced
+because query-service's Testcontainers-managed test broker starts
+completely empty (no topics pre-created, unlike the real
+`docker-compose` broker where `infra/kafka/init-topics.sh` already
+creates all 8 topics) — so every test run was silently leaving the
+Streams thread broken, without failing the actual JUnit assertion
+(`contextLoads()` only checks the Spring context starts, not that every
+bean is healthy).
+
+**Fix:** declared `user-activity.events` as a Spring-managed `NewTopic`
+bean (`TopicBuilder.name(...).partitions(3).replicas(1).build()`) in
+`UserActivityStreamsConfig`. Spring Boot's `KafkaAdmin` auto-configuration
+picks up every `NewTopic` bean in the context and idempotently ensures
+it exists before the rest of the context (including the Streams thread)
+starts — a no-op against the real broker (topic already exists there),
+but exactly what the empty test broker needed. Re-ran the test suite
+after the fix and confirmed via the raw log output that the
+`StreamThread` now reaches `RUNNING` (previously: permanently `ERROR`,
+with the build still reporting `BUILD SUCCESSFUL`/no test failures,
+since nothing was asserting on Streams health specifically). Worth
+remembering for Phase 8 (ingestion-service) and any future service that
+adds its own Kafka Streams topology: **always declare a `NewTopic` bean
+for every source topic a topology reads from**, even though no other
+`KafkaTopics` class in this project has ever needed to do this for
+plain `@KafkaListener` consumers.
+
+---
+
 ## Cross-cutting notes for Phase 5+ (shipping-service, query-service, and beyond)
 
 Things established in Phases 2-4 (and the post-Phase-3/4 fixes) that

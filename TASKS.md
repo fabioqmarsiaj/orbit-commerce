@@ -275,9 +275,10 @@ stable, or as part of Phase 10 polish.
       `InventoryEventListener`/`PaymentEventListener`/`ShippingEventListener` +
       `TimelineRecorder`/`OrderSummaryProjector`
 - [x] P0 REST API: `GET /orders/{id}/timeline`, `GET /orders?status=`
-- [ ] P1 Kafka Streams topology over `user-activity.events`: tumbling window (1 min) of
-      ProductViewed grouped by productId, count via state store
-- [ ] P1 Interactive query endpoint: `GET /analytics/top-products`
+- [x] P1 Kafka Streams topology over `user-activity.events`: tumbling window (1 min) of
+      ProductViewed grouped by productId, count via state store — `UserActivityStreamsConfig`
+- [x] P1 Interactive query endpoint: `GET /analytics/top-products` — `TopProductsQueryService`
+      + `AnalyticsController`
 - [ ] P2 Integration tests (Testcontainers, incl. Kafka Streams TopologyTestDriver)
 
 query-service is architecturally different from every prior service: a pure CQRS
@@ -305,9 +306,36 @@ and a failure/compensation path correctly show the full cross-topic event
 sequence via `GET /orders/{id}/timeline`, and `GET /orders?status=` correctly
 reflects each order's terminal status.
 
-Kafka Streams (Part B) is deferred to a separate implementation pass — see
-below once it lands; can't be manually verified with real traffic until
-ingestion-service (Phase 8) exists to actually produce `user-activity.events`.
+### Part B: Kafka Streams analytics
+`spring-boot-starter-kafka` (already a dependency everywhere) already transitively
+brings `@EnableKafkaStreams`/`StreamsBuilderFactoryBean`, and Spring Boot's own
+`spring-boot-kafka` autoconfiguration auto-builds the required
+`KafkaStreamsConfiguration` bean from `spring.kafka.streams.*` properties once that
+bean is registered — so the only new dependency needed was
+`io.confluent:kafka-streams-avro-serde:7.6.13`; no manual `KafkaStreamsConfiguration`
+bean was written. `user-activity.events` carries 3 Avro types sharing one topic
+(same multi-type-topic shape as everywhere else), so the topology reads
+`GenericRecord` (via `GenericAvroSerde`) and filters down to `ProductViewed` by
+checking `record.getSchema().getName()` — the Kafka-Streams-side equivalent of the
+`eventType` discriminator pattern used throughout this project.
+`GET /analytics/top-products?limit=` queries only the current (most recent) 1-minute
+window via `StreamsBuilderFactoryBean` + `ReadOnlyWindowStore` — returns an empty
+list until ingestion-service (Phase 8) produces real `ProductViewed` traffic, which
+is expected, not a bug.
+
+A real bug was found and fixed via query-service's own (unchanged) test suite:
+Kafka Streams treats a missing SOURCE topic very differently from a plain
+`@KafkaListener` (which just waits/retries) — it throws `MissingSourceTopicException`
+and leaves the `StreamThread` PERMANENTLY in the `ERROR` state, which doesn't fail
+`contextLoads()` (nothing asserts on Streams health) so the build reported success
+while the Streams thread was silently broken every test run, because the ephemeral
+Testcontainers test broker starts with no topics pre-created (unlike the real
+`docker-compose` broker). Fixed by declaring `user-activity.events` as a
+Spring-managed `NewTopic` bean, which `KafkaAdmin` idempotently ensures exists
+before the Streams thread starts (a no-op against the real broker). See
+`docs/decisions.md` ("Phase 7 — query-service (Part B: Kafka Streams analytics)")
+for the full writeup — this pattern (`NewTopic` bean per Streams source topic)
+should be reused for any future service adding its own Kafka Streams topology.
 
 ## Phase 8 — ingestion-service (Go)
 - [ ] P0 Go project setup (kafka-go or confluent-kafka-go)

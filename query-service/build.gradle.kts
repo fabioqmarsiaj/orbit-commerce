@@ -13,6 +13,7 @@ dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-webmvc")
 	implementation("org.apache.kafka:kafka-streams")
 	implementation("io.confluent:kafka-avro-serializer:7.6.13")
+	implementation("io.confluent:kafka-streams-avro-serde:7.6.13")
 	compileOnly("org.projectlombok:lombok")
 	runtimeOnly("org.postgresql:postgresql")
 	annotationProcessor("org.projectlombok:lombok")
