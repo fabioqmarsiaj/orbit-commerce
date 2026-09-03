@@ -1,4 +1,4 @@
-package com.fabioqmarsiaj.inventory.persistence;
+package com.fabioqmarsiaj.outbox.persistence;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 
@@ -9,7 +9,9 @@ public interface OutboxRepository extends JpaRepository<OutboxEntity, UUID> {
 
     /**
      * @return pending outbox rows, oldest first, so the poller publishes
-     *         events in the order they were recorded.
+     *         events in the order they were recorded. Consider adding a
+     *         {@code Pageable}/limit parameter later to avoid pulling an
+     *         unbounded number of rows in one poll cycle.
      */
     List<OutboxEntity> findByStatusOrderByCreatedAtAsc(OutboxStatus status);
 }

@@ -456,10 +456,190 @@ app-generated UUIDs specifically.
 
 ---
 
+## Post-Phase 3 refactor — extracting `outbox-support`
+
+By the end of Phase 3, `order-service` and `inventory-service` each had
+their own, nearly byte-for-byte identical copies of `OutboxEntity`,
+`OutboxStatus`, `OutboxRepository`, and `OutboxPublisher` (the whole
+polling/`TransactionTemplate`-per-row/retry mechanism from the Phase 3
+bugfix section above) — ~700 combined lines of duplicated code across the
+two services, and every future bug found in that machinery (like the two
+found during Phase 3 testing) would need to be fixed twice, then a third
+time in payment-service, a fourth in shipping-service. This was flagged
+as worth fixing before it happened a third time, and addressed
+immediately after Phase 3 rather than deferred to Phase 10 "polish".
+
+### Why this doesn't conflict with "database per service"
+Worth stating explicitly, since it might look contradictory at first: the
+core guarantee of the Outbox pattern is that the domain write and the
+"intent to publish" write happen in the SAME database transaction — which
+only works if the outbox table lives in the SAME database as the domain
+tables it's paired with. So even though the *code* (entity class,
+repository interface, publisher logic) is now shared via a common Gradle
+module, every service still has its OWN `outbox` table, in its OWN
+database (`order_db`'s `outbox`, `inventory_db`'s `outbox`, etc.) — the
+module shares behavior, not data or a transaction boundary. This is the
+standard shape of the Transactional Outbox pattern in the literature
+(e.g. microservices.io): one outbox table per service, not a shared
+"outbox service" (which would just reintroduce the original dual-write
+problem, now over the network instead of within a process).
+
+### New module: `outbox-support`
+A library module (not a runnable Spring Boot application — no
+`org.springframework.boot` plugin applied, following the same shape as
+the pre-existing `event-schemas` module) added to `settings.gradle.kts`,
+containing:
+- `persistence/OutboxEntity.java`, `OutboxStatus.java`,
+  `OutboxRepository.java` — moved verbatim (byte-for-byte identical logic)
+  from `order-service`.
+- `application/OutboxRecorder.java` — a new `@Component` extracting what
+  used to be a private `toAvroJson` + entity-building block duplicated
+  inside both services' `OutboxWriter` classes. Exposes one method,
+  `record(aggregateId, topic, avroRecord)`.
+- `application/AbstractOutboxPublisher.java` — a new abstract class
+  extracting the entire polling loop, the `TransactionTemplate`-per-row
+  logic, and the Avro-JSON decode helper from what used to be two
+  separate concrete `OutboxPublisher` classes. Leaves exactly one method
+  abstract: `toAvroRecord(eventType, payload)`, since mapping a stored
+  event-type string back to a concrete Avro class is the one piece that's
+  genuinely different per service.
+
+Each service now keeps a small concrete subclass:
+```java
+@Component
+public class OutboxPublisher extends AbstractOutboxPublisher {
+    public OutboxPublisher(OutboxRepository r, KafkaTemplate<String,Object> k,
+                            PlatformTransactionManager tm) { super(r, k, tm); }
+
+    @Scheduled(fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}")
+    @Override
+    public void publishPending() { super.publishPending(); }   // see below for why overridden here
+
+    @Override
+    protected SpecificRecord toAvroRecord(String eventType, String payload) {
+        return switch (eventType) { /* this service's event types */ };
+    }
+}
+```
+and a thin `OutboxWriter` that builds its own service-specific Avro
+records and delegates to `OutboxRecorder.record(...)` instead of doing
+the encoding/entity-building itself.
+
+**Why `@Scheduled` + the `publishPending()` override stays in each
+subclass, not the abstract base class:** two reasons. First, the
+`fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}"` SpEL
+placeholder needs to resolve against each service's OWN
+`application.properties` (both already define this key with the same
+name, but they're independent values in independent property files —
+putting `@Scheduled` on the base class would still work since Spring
+resolves the placeholder against whichever service's Environment the
+bean lives in, but it's clearer and less "spooky action at a distance"
+to have it visible on the concrete class). Second, relying on Spring to
+correctly detect and schedule an inherited (non-overridden)
+`@Scheduled` method is a less commonly exercised code path than a method
+declared directly on the bean's own class — overriding costs three lines
+per service and removes any doubt.
+
+### The `Persistable<UUID>` interface lives in the shared module now, `docs/decisions.md`'s Phase 2/3 explanations still apply
+No behavior changed here — `OutboxEntity`'s `Persistable<UUID>` +
+`@Transient boolean isNew` implementation is identical to what it was
+before the move (see the Phase 2 section above for the full "why"). Only
+its package changed, from `com.fabioqmarsiaj.order.persistence` /
+`com.fabioqmarsiaj.inventory.persistence` to
+`com.fabioqmarsiaj.outbox.persistence`.
+
+### Required bootstrap change: explicit `@EntityScan`/`@EnableJpaRepositories`/`scanBasePackages`
+This was the one genuinely tricky, non-mechanical part of the extraction.
+`@SpringBootApplication` only component-scans (and, transitively via
+`@EnableAutoConfiguration`'s JPA auto-configuration, entity/repository
+-scans) the package the annotated class lives in, plus subpackages. Since
+`com.fabioqmarsiaj.outbox` is a sibling package to
+`com.fabioqmarsiaj.order`/`com.fabioqmarsiaj.inventory`, NOT a
+subpackage, the default scan would never find `OutboxEntity`,
+`OutboxRepository`, or the `@Component`-annotated `OutboxRecorder`/
+`OutboxPublisher` subclasses after the move — the service would either
+fail to start (`NoSuchBeanDefinitionException` for `OutboxRepository`)
+or, worse, start but silently never create the `outbox` table.
+
+Fixed by widening the scan explicitly on both `OrderServiceApplication`
+and `InventoryServiceApplication`:
+```java
+@SpringBootApplication(scanBasePackages = {"com.fabioqmarsiaj.order", "com.fabioqmarsiaj.outbox"})
+@EnableScheduling
+@EntityScan(basePackages = {"com.fabioqmarsiaj.order.persistence", "com.fabioqmarsiaj.outbox.persistence"})
+@EnableJpaRepositories(basePackages = {"com.fabioqmarsiaj.order.persistence", "com.fabioqmarsiaj.outbox.persistence"})
+public class OrderServiceApplication { ... }
+```
+(swap `order`/`com.fabioqmarsiaj.order.persistence` for
+`inventory`/`com.fabioqmarsiaj.inventory.persistence` in
+`InventoryServiceApplication`). All three annotations/attributes were
+needed together: `scanBasePackages` alone finds `@Component`s
+(`OutboxRecorder`, the concrete `OutboxPublisher` subclass) but not JPA
+entities/repositories; `@EntityScan` and `@EnableJpaRepositories` are
+what Spring Boot's JPA auto-configuration actually consults for entity
+classes and repository interfaces respectively — omitting either one
+still breaks it, just with a different, more Hibernate/Spring-Data
+-specific error further into startup.
+
+### Gradle module-plumbing gotchas hit while creating `outbox-support`
+Two errors surfaced immediately when trying to compile the new module,
+both fixed and worth remembering for any future non-Spring-Boot library
+module in this monorepo:
+1. **`Unresolved reference 'api'`** — the `api(...)` dependency
+   configuration (as opposed to `implementation(...)`) is only available
+   under the `java-library` Gradle plugin, not the plain `java` plugin.
+   `event-schemas` gets away with plain `java` because it only exposes
+   generated Avro classes via `implementation`-declared Avro itself, but
+   `outbox-support` needs `api` so consuming services see types like
+   `KafkaTemplate`/`OutboxEntity` directly on their own compile
+   classpath (they appear in `AbstractOutboxPublisher`'s and
+   `OutboxEntity`'s own public signatures). Fixed by using the
+   `` `java-library` `` plugin instead of `java`.
+2. **`package jakarta.persistence does not exist`** — depending on
+   `org.springframework.data:spring-data-jpa` alone (even via the Spring
+   Boot BOM for version alignment) does NOT transitively pull in the JPA
+   API itself (`jakarta.persistence-api`) the way
+   `spring-boot-starter-data-jpa` does for an actual application module —
+   the starter's own dependency graph adds it, but this module can't use
+   that starter (no Spring Boot plugin applied). Fixed by adding
+   `api("jakarta.persistence:jakarta.persistence-api")` explicitly,
+   version-aligned via the same Spring Boot BOM import
+   (`dependencyManagement { imports { mavenBom(...) } }` from the
+   `io.spring.dependency-management` plugin) already used for
+   `spring-data-jpa`/`spring-kafka`.
+
+### Verification performed for this refactor
+Both service test suites (Testcontainers-backed, exercising a real
+Spring context against real Postgres/Kafka containers) were re-run and
+passed after the extraction — this specifically exercises whether the
+`@EntityScan`/`@EnableJpaRepositories` widening actually works, since a
+misconfigured scan would fail context startup, not just a specific test
+assertion. The full manual end-to-end walkthrough from the Phase 3
+section above (seed stock, happy path reservation + decrement, rejection
+path + stock left unchanged + order cancelled) was also re-run against
+both `bootRun` instances after the refactor and confirmed working
+identically to before.
+
+---
+
 ## Cross-cutting notes for Phase 4+ (payment-service, shipping-service, and beyond)
 
-Things established in Phases 2-3 that will likely recur:
+Things established in Phases 2-3 (and the post-Phase-3 refactor) that
+will likely recur:
 
+- **Depend on `outbox-support` (`implementation(project(":outbox-support"))`),
+  don't reimplement the outbox.** payment-service and shipping-service
+  should each get a thin `OutboxWriter` (building their own Avro records,
+  delegating to `OutboxRecorder.record(...)`) and a thin
+  `OutboxPublisher extends AbstractOutboxPublisher` (just the
+  `@Scheduled` override + a `toAvroRecord` switch), exactly like
+  order-service/inventory-service — see the "Post-Phase 3 refactor"
+  section above for the full shape.
+- **Remember the `@EntityScan`/`@EnableJpaRepositories`/`scanBasePackages`
+  widening** on each new service's `@SpringBootApplication` class — see
+  above for the exact annotations needed and why; easy to forget since
+  the service will compile fine and only fail (or worse, silently
+  misbehave) at runtime without it.
 - Reuse the `Persistable<UUID>` / `Persistable<String>` pattern for any
   entity whose `@Id` is never null at construction time — whether an
   app-assigned UUID or a natural/business key.
@@ -468,21 +648,16 @@ Things established in Phases 2-3 that will likely recur:
 - Remember Jackson 3 (`tools.jackson.databind.ObjectMapper`) if any service
   needs to hand-serialize domain events to JSON like `OrderEventMapper` does.
 - Remember the Avro JSON codec (`EncoderFactory`/`DecoderFactory` +
-  `SpecificDatumWriter`/`SpecificDatumReader`) if any service implements
-  its own outbox (payment/shipping-service both publish events —
-  `PaymentApproved`, `ShipmentCreated`, etc. — so they likely need the
-  same outbox infrastructure order-service and inventory-service have).
+  `SpecificDatumWriter`/`SpecificDatumReader`) is already handled for you
+  inside `outbox-support`'s `OutboxRecorder`/`AbstractOutboxPublisher` —
+  no need to hand-roll it again for payment-service/shipping-service's
+  own outbox.
 - **Set `spring.kafka.producer.properties.value.subject.name.strategy=
   io.confluent.kafka.serializers.subject.RecordNameStrategy` from the
   START** for any service producing to a topic that carries more than one
   event type (which is every `*.events`/`*.commands` topic in this
   project) — don't wait to rediscover the Phase 3 Schema Registry bug
   again.
-- **Give the outbox publisher one transaction per row, not one per
-  batch**, from the start (see Phase 3 section above) — copy
-  `order-service`/`inventory-service`'s `TransactionTemplate`-based
-  `OutboxPublisher` rather than the simpler single-`@Transactional`
-  version.
 - Decide up front whether payment/shipping-service's own Saga replies
   (their `*.events` topics) should go through an outbox from the start,
   given the known gap in order-service's Saga *commands* (see Phase 2
@@ -498,3 +673,8 @@ Things established in Phases 2-3 that will likely recur:
   stock reservation), consider the atomic-conditional-UPDATE +
   in-transaction-compensation pattern documented above rather than
   optimistic locking with a retry loop.
+- If a new library module is needed (like `outbox-support`), remember it
+  needs `` `java-library` `` (not plain `java`) to use `api(...)`
+  dependencies, and may need dependencies explicitly declared that a
+  Spring Boot starter would normally provide transitively (e.g.
+  `jakarta.persistence-api`) — see the Gradle gotchas above.

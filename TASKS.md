@@ -119,6 +119,31 @@ successfully, causing them to be re-published (duplicated) on the next poll; fix
 by publishing each row in its own transaction via a programmatic
 `TransactionTemplate`. See `docs/decisions.md` for the full writeup of both.
 
+### Post-Phase 3: extracted shared `outbox-support` module
+Once inventory-service was the second service with a near-identical copy
+of the Outbox pattern's plumbing (`OutboxEntity`, `OutboxStatus`,
+`OutboxRepository`, `OutboxPublisher`), that duplication (~700 lines
+across the two services) was extracted into a new library module,
+`outbox-support` (added to `settings.gradle.kts`, no Spring Boot plugin —
+same shape as `event-schemas`), before it could be copy-pasted a third
+time into payment-service. `order-service` and `inventory-service` now
+both `implementation(project(":outbox-support"))` and keep only a thin,
+service-specific `OutboxWriter` (builds this service's Avro events) and
+`OutboxPublisher extends AbstractOutboxPublisher` (just a
+`toAvroRecord(eventType, payload)` switch + the `@Scheduled` method).
+Required adding explicit `scanBasePackages`/`@EntityScan`/
+`@EnableJpaRepositories` to both services' `@SpringBootApplication`
+classes, since `com.fabioqmarsiaj.outbox` is a sibling package, not a
+subpackage, of either service's own base package. Both services' test
+suites (Testcontainers) and the full manual end-to-end walkthrough
+(happy path + rejection path) were re-run and pass identically to
+before the extraction. See `docs/decisions.md` ("Post-Phase 3 refactor —
+extracting `outbox-support`") for the full writeup, including two Gradle
+module-plumbing gotchas hit while creating the new module
+(`java-library` vs `java` plugin for `api(...)` dependencies; needing to
+explicitly add `jakarta.persistence-api` since it's not transitively
+pulled in outside of `spring-boot-starter-data-jpa`).
+
 ## Phase 4 — payment-service
 - [ ] P0 Spring Boot 4 + Postgres setup (payment_db)
 - [ ] P0 `ProcessPaymentCommand` consumer → simulates approval/decline (simple rule,
@@ -127,12 +152,26 @@ by publishing each row in its own transaction via a programmatic
 - [ ] P1 Idempotent consumption
 - [ ] P1 Integration tests (Testcontainers)
 
+Depend on `outbox-support` (`implementation(project(":outbox-support"))`)
+from the start rather than reimplementing the outbox — see the
+post-Phase-3 refactor note above and `docs/decisions.md` for the exact
+shape (thin `OutboxWriter` + `OutboxPublisher extends
+AbstractOutboxPublisher`), and remember the `@EntityScan`/
+`@EnableJpaRepositories`/`scanBasePackages` widening this requires on
+`PaymentServiceApplication`. Also set
+`spring.kafka.producer.properties.value.subject.name.strategy=io.confluent.kafka.serializers.subject.RecordNameStrategy`
+from the start (Phase 3 Schema Registry bug — see above).
+
 ## Phase 5 — shipping-service
 - [ ] P0 Spring Boot 4 + Postgres setup (shipping_db)
 - [ ] P0 `CreateShipmentCommand` consumer → simulates shipment creation (can be forced to
       fail to test compensation) → ShipmentCreated/ShipmentFailed via outbox
 - [ ] P1 Idempotent consumption
 - [ ] P1 Integration tests (Testcontainers)
+
+Same notes as Phase 4 apply: depend on `outbox-support`, remember the
+entity/repository scan widening, and set `RecordNameStrategy` from the
+start.
 
 ## Phase 6 — End-to-end Saga
 - [ ] P0 Validate full happy path (order → stock → payment → shipping → completed)
