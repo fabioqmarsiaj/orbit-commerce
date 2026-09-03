@@ -144,6 +144,33 @@ module-plumbing gotchas hit while creating the new module
 explicitly add `jakarta.persistence-api` since it's not transitively
 pulled in outside of `spring-boot-starter-data-jpa`).
 
+### Post-Phase 3: routed Saga commands through the outbox too
+The Phase 2 design deliberately sent Saga commands
+(ReserveStockCommand/ProcessPaymentCommand/CreateShipmentCommand/
+ReleaseStockCommand/RefundPaymentCommand) directly via `KafkaTemplate`,
+bypassing the outbox — flagged at the time as a meaningful inconsistency
+worth revisiting. Working through exactly what could go wrong surfaced a
+real gap: `KafkaTemplate#send` returns a `CompletableFuture` that was
+never awaited, so an asynchronous send failure (e.g. a transient broker
+outage) after the transaction had already committed would be silently
+swallowed — the order would advance in the database but the command
+driving the Saga forward would simply never arrive, with no error and no
+retry. Fixed by routing all 6 command-sending call sites in
+`OrderCommandService` through the outbox instead (a new
+`OutboxWriter#writeCommand` + 5 more cases in `OutboxPublisher`'s
+`toAvroRecord` switch) — no schema change needed, since
+`outbox-support`'s `OutboxEntity`/`OutboxRecorder`/
+`AbstractOutboxPublisher` were already generic over `(aggregateId, topic,
+SpecificRecord)` with no built-in assumption that rows have to be
+"events" rather than "commands". `OrderCommandService`'s `KafkaTemplate`
+dependency was removed entirely. Manually verified via
+`POST /orders`: `order_db.outbox` shows `OrderCreated`,
+`ReserveStockCommand`, and `ProcessPaymentCommand` all transitioning
+`PENDING` → `PUBLISHED`, and inventory-service still correctly receives
+and reacts to `ReserveStockCommand`. See `docs/decisions.md`
+("Post-Phase 3 hardening — routing Saga commands through the outbox")
+for the full writeup.
+
 ## Phase 4 — payment-service
 - [ ] P0 Spring Boot 4 + Postgres setup (payment_db)
 - [ ] P0 `ProcessPaymentCommand` consumer → simulates approval/decline (simple rule,

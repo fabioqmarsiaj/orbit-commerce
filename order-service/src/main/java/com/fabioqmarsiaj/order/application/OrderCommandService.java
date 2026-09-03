@@ -5,7 +5,7 @@ import com.fabioqmarsiaj.order.domain.OrderLineItem;
 import com.fabioqmarsiaj.order.messaging.KafkaTopics;
 import com.fabioqmarsiaj.order.messaging.SagaCommandFactory;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.core.KafkaTemplate;
+import org.apache.avro.specific.SpecificRecord;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,19 +21,27 @@ import java.util.UUID;
  *   <li>Persists those events to the event store + outbox, atomically, in
  *       one DB transaction ({@link OrderEventStore#append} +
  *       {@link OutboxWriter#writeAll}).</li>
- *   <li>After the transaction commits, sends the next Saga command (if
- *       any) to the appropriate participant service, via
- *       {@link SagaCommandFactory} + a Kafka producer.</li>
+ *   <li>Records the next Saga command (if any) to the outbox too, in the
+ *       SAME transaction ({@link OutboxWriter#writeCommand}) — the actual
+ *       send to the participant service happens later, out-of-band, via
+ *       {@link OutboxPublisher}.</li>
  * </ol>
  *
- * <p>Step 4 deliberately happens via a direct Kafka send rather than
- * through the outbox — worth reflecting on, and discussing in review,
- * whether that is a meaningful inconsistency in this design (what happens
- * if the process crashes between steps 3 and 4?), and what it would take
- * to fix it (hint: the outbox could carry commands too, with a second
- * poller/topic mapping, or a single generic outbox keyed by topic name —
- * look at how {@link OutboxWriter} already stores an explicit
- * {@code topic} column).
+ * <p>Steps 3 and 4 both go through the outbox now — Saga commands used to
+ * be sent directly via a Kafka producer instead, which had a real gap:
+ * {@code KafkaTemplate#send} returns a {@code CompletableFuture} that was
+ * never awaited, so an asynchronous send failure (e.g. a transient broker
+ * outage, as opposed to a synchronous failure like a schema error) was
+ * silently swallowed after the transaction had already committed — the
+ * order would advance in the database but the command that was supposed
+ * to move the Saga forward would simply never arrive, with no error, no
+ * retry, and no way to notice short of manually inspecting the database.
+ * Routing commands through the outbox closes that gap the same way it was
+ * already closed for {@code order.events}: recording the "intent to send"
+ * atomically with the domain change, and letting
+ * {@link OutboxPublisher}'s synchronous send + per-row transaction +
+ * automatic retry-on-next-poll take over from there. See
+ * {@code docs/decisions.md} for the full writeup.
  *
  * <p>Each {@code handleXxx} method corresponds to reacting to one incoming
  * Kafka event from a participant service (see the {@code messaging}
@@ -47,15 +55,12 @@ public class OrderCommandService {
     private final OrderEventStore eventStore;
     private final OutboxWriter outboxWriter;
     private final SagaCommandFactory commandFactory;
-    private final KafkaTemplate<String, Object> kafkaTemplate;
 
     public OrderCommandService(OrderEventStore eventStore, OutboxWriter outboxWriter,
-                                SagaCommandFactory commandFactory,
-                                KafkaTemplate<String, Object> kafkaTemplate) {
+                                SagaCommandFactory commandFactory) {
         this.eventStore = eventStore;
         this.outboxWriter = outboxWriter;
         this.commandFactory = commandFactory;
-        this.kafkaTemplate = kafkaTemplate;
     }
 
     /**
@@ -70,9 +75,7 @@ public class OrderCommandService {
         Order order = Order.create(orderId, customerId, items);
         persistAndPullEvents(order);
 
-        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
-                commandFactory.reserveStock(order));
-        log.info("Order {}: sent ReserveStockCommand to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
+        recordCommand(orderId, KafkaTopics.INVENTORY_COMMANDS, commandFactory.reserveStock(order));
 
         return orderId;
     }
@@ -87,9 +90,7 @@ public class OrderCommandService {
         order.markStockReserved();
         persistAndPullEvents(order);
 
-        kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
-                commandFactory.processPayment(order));
-        log.info("Order {}: sent ProcessPaymentCommand to topic {}", orderId, KafkaTopics.PAYMENT_COMMANDS);
+        recordCommand(orderId, KafkaTopics.PAYMENT_COMMANDS, commandFactory.processPayment(order));
     }
 
     /**
@@ -115,9 +116,7 @@ public class OrderCommandService {
         order.markPaymentApproved(paymentId);
         persistAndPullEvents(order);
 
-        kafkaTemplate.send(KafkaTopics.SHIPPING_COMMANDS, orderId.toString(),
-                commandFactory.createShipment(order));
-        log.info("Order {}: sent CreateShipmentCommand to topic {}", orderId, KafkaTopics.SHIPPING_COMMANDS);
+        recordCommand(orderId, KafkaTopics.SHIPPING_COMMANDS, commandFactory.createShipment(order));
     }
 
     /**
@@ -130,9 +129,7 @@ public class OrderCommandService {
         order.markPaymentDeclined(reason);
         persistAndPullEvents(order);
 
-        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
-                commandFactory.releaseStock(order));
-        log.info("Order {}: sent ReleaseStockCommand (compensation) to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
+        recordCommand(orderId, KafkaTopics.INVENTORY_COMMANDS, commandFactory.releaseStock(order));
     }
 
     /**
@@ -158,13 +155,8 @@ public class OrderCommandService {
         order.markShipmentFailed(reason);
         persistAndPullEvents(order);
 
-        kafkaTemplate.send(KafkaTopics.PAYMENT_COMMANDS, orderId.toString(),
-                commandFactory.refundPayment(order));
-        log.info("Order {}: sent RefundPaymentCommand (compensation) to topic {}", orderId, KafkaTopics.PAYMENT_COMMANDS);
-
-        kafkaTemplate.send(KafkaTopics.INVENTORY_COMMANDS, orderId.toString(),
-                commandFactory.releaseStock(order));
-        log.info("Order {}: sent ReleaseStockCommand (compensation) to topic {}", orderId, KafkaTopics.INVENTORY_COMMANDS);
+        recordCommand(orderId, KafkaTopics.PAYMENT_COMMANDS, commandFactory.refundPayment(order));
+        recordCommand(orderId, KafkaTopics.INVENTORY_COMMANDS, commandFactory.releaseStock(order));
     }
 
     /**
@@ -179,5 +171,17 @@ public class OrderCommandService {
         eventStore.append(order.getId(), events);
         outboxWriter.writeAll(order.getId(), events);
         log.info("Order {}: persisted {} event(s) to order_events and outbox", order.getId(), events.size());
+    }
+
+    /**
+     * Shared helper: records one Saga command to the outbox, in the same
+     * transaction as whatever domain event(s) triggered it (see
+     * {@link #persistAndPullEvents}, always called first). The actual
+     * send to Kafka happens later, out-of-band, via {@link OutboxPublisher}.
+     */
+    private void recordCommand(UUID orderId, String topic, SpecificRecord command) {
+        outboxWriter.writeCommand(orderId, topic, command);
+        log.info("Order {}: recorded {} command to outbox for topic {}",
+                orderId, command.getClass().getSimpleName(), topic);
     }
 }

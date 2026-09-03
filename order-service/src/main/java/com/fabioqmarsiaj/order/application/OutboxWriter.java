@@ -51,4 +51,28 @@ public class OutboxWriter {
             outboxRecorder.record(orderId, KafkaTopics.ORDER_EVENTS, avroRecord);
         }
     }
+
+    /**
+     * Records one outbox row for a Saga command that {@code OrderCommandService}
+     * needs to send to a participant service (inventory-service,
+     * payment-service, or shipping-service), on whichever
+     * {@code *.commands} topic the caller specifies.
+     *
+     * <p>Saga commands used to be sent directly via {@code KafkaTemplate},
+     * bypassing the outbox entirely — a real gap, since
+     * {@code KafkaTemplate#send} returns a {@code CompletableFuture} that
+     * was never awaited/observed: an async send failure (e.g. a broker
+     * outage) would be silently swallowed after the enclosing transaction
+     * had already committed, leaving the order stuck in its current state
+     * forever with no record of the failure. Routing commands through the
+     * outbox (this method) closes that gap the exact same way it's already
+     * closed for {@code order.events}: the "intent to send" is now
+     * recorded in the SAME transaction as the domain event(s) that
+     * triggered it, and {@code AbstractOutboxPublisher}'s synchronous
+     * send + per-row transaction + automatic retry-on-next-poll take over
+     * from there. See {@code docs/decisions.md} for the full writeup.
+     */
+    public void writeCommand(UUID orderId, String topic, SpecificRecord command) {
+        outboxRecorder.record(orderId, topic, command);
+    }
 }

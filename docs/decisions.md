@@ -622,6 +622,111 @@ identically to before.
 
 ---
 
+## Post-Phase 3 hardening — routing Saga commands through the outbox
+
+### The gap: `kafkaTemplate.send()` for Saga commands was fire-and-forget
+`OrderCommandService` originally sent all 5 Saga commands
+(`ReserveStockCommand`, `ProcessPaymentCommand`, `CreateShipmentCommand`,
+`ReleaseStockCommand`, `RefundPaymentCommand`) directly via
+`KafkaTemplate#send`, immediately after the `@Transactional` method that
+persisted the domain event(s) which triggered them — this was called out
+as a deliberate-but-risky simplification since Phase 2 (see that
+section's Javadoc excerpt), but the exact failure mode was only worked
+through in detail here, in a Q&A about how the pattern actually behaves.
+
+`KafkaTemplate#send(...)` returns a `CompletableFuture<SendResult>`
+without blocking — under the hood, `KafkaProducer#send` does
+serialization/partitioning synchronously (inline, inside the `send()`
+call) but the actual network I/O (talking to the broker, waiting for an
+ack) happens asynchronously, completing the future later on a background
+thread. None of `OrderCommandService`'s 6 call sites awaited or even
+inspected that future (no `.join()`, `.get()`, or `.whenComplete()`).
+That split created two very different failure behaviors depending on
+where a send actually failed:
+- **Synchronous failure** (e.g. an Avro schema registration error, like
+  the Phase 3 `RecordNameStrategy` bug) — propagates immediately as an
+  exception out of `.send()`, and since the enclosing method is
+  `@Transactional`, Spring rolls back the WHOLE transaction (undoing the
+  domain event(s) that had already been persisted too). Loud and safe:
+  the client gets an HTTP 500, nothing was left half-done, and the
+  request can simply be retried.
+- **Asynchronous failure** (e.g. a transient broker outage, a network
+  timeout) — the exception only surfaces later, on the future, which
+  nothing was listening to. The `@Transactional` method has ALREADY
+  returned and committed by the time the failure happens — the order's
+  domain state has advanced in the database, but the command that was
+  supposed to drive the Saga forward silently never left the process.
+  No log, no retry, no alert: the order is just stuck in its current
+  state forever, discoverable only by manually noticing it never
+  progresses.
+
+### The fix: commands go through the outbox too, reusing the exact same machinery as events
+Since `OutboxEntity`/`OutboxRecorder`/`AbstractOutboxPublisher` (in
+`outbox-support`) were already generic over an arbitrary `(aggregateId,
+topic, SpecificRecord)` triple — with no assumption baked in that the
+`SpecificRecord` has to be an "event" rather than a "command" — closing
+this gap required no schema change and no new infrastructure, only
+routing `OrderCommandService`'s command-sending call sites through the
+outbox instead of a direct `KafkaTemplate` call:
+- `OutboxWriter` (order-service) gained one new method,
+  `writeCommand(orderId, topic, command)`, a thin wrapper around
+  `OutboxRecorder.record(...)` — symmetric to the pre-existing `writeAll`
+  (which handles the 4 `Order*` integration events).
+- `OrderCommandService`'s `KafkaTemplate` dependency was removed
+  entirely; each of the 6 call sites now calls a private
+  `recordCommand(orderId, topic, command)` helper instead, which just
+  delegates to `outboxWriter.writeCommand(...)` — still inside the same
+  `@Transactional` method, so the command's "intent to send" is recorded
+  atomically with the domain event(s) that triggered it, exactly like
+  events already were.
+- `OutboxPublisher` (order-service) gained 5 more cases in its
+  `toAvroRecord` switch (`ReserveStockCommand`, `ReleaseStockCommand`,
+  `ProcessPaymentCommand`, `RefundPaymentCommand`,
+  `CreateShipmentCommand`) — no other change; the exact same polling
+  loop, per-row `TransactionTemplate`, synchronous `.join()` send, and
+  retry-on-next-poll behavior that was already handling `order.events`
+  now also handles `inventory.commands`/`payment.commands`/
+  `shipping.commands`. One `outbox` table, one publisher, one poll loop,
+  now carrying both events and commands — the `topic` column (already
+  present on every row since Phase 2) is what routes each row to the
+  right destination; nothing in the publishing mechanism needed to know
+  or care about the event/command distinction.
+
+This closes the async-failure gap the same way it was already closed for
+integration events: a row only ever gets marked `PUBLISHED` after
+`AbstractOutboxPublisher`'s synchronous `.join()` confirms the Kafka send
+actually succeeded; if it doesn't, the row's own transaction rolls back,
+it stays `PENDING`, and the next poll (2s later, by default) retries it
+automatically — no manual intervention, no silent data loss.
+
+### Manually verified
+`POST /orders` against a freshly-seeded stock level, watching both
+services' logs and querying the `order_db.outbox` table directly:
+```
+event_type             | topic               | status
+OrderCreated           | order.events        | PUBLISHED
+ReserveStockCommand    | inventory.commands  | PUBLISHED
+ProcessPaymentCommand  | payment.commands    | PUBLISHED
+```
+`ReserveStockCommand` and `ProcessPaymentCommand` now go through the same
+`outbox` table and `PENDING` → `PUBLISHED` lifecycle as `OrderCreated` —
+confirming inventory-service still receives and reacts to
+`ReserveStockCommand` correctly (it published `StockReserved` in
+response, which is only reachable by first having consumed the command),
+and the Saga continues to advance exactly as it did with the old
+direct-`KafkaTemplate` approach, just without the async-failure gap.
+
+### Scope: order-service only
+inventory-service is a Saga *participant*, not the orchestrator — it has
+never sent commands (only events, which already went through the outbox
+since Phase 3), so no change was needed there. The same fix should be
+applied proactively in payment-service/shipping-service if either of
+them ever needs to send an outgoing command of their own (none currently
+do — both are terminal participants in their part of the Saga, only ever
+replying with events, never issuing further commands downstream).
+
+---
+
 ## Cross-cutting notes for Phase 4+ (payment-service, shipping-service, and beyond)
 
 Things established in Phases 2-3 (and the post-Phase-3 refactor) that
@@ -658,12 +763,16 @@ will likely recur:
   event type (which is every `*.events`/`*.commands` topic in this
   project) — don't wait to rediscover the Phase 3 Schema Registry bug
   again.
-- Decide up front whether payment/shipping-service's own Saga replies
-  (their `*.events` topics) should go through an outbox from the start,
-  given the known gap in order-service's Saga *commands* (see Phase 2
-  section above) — inventory-service and payment/shipping-service's
-  *events* already do use an outbox; only the orchestrator's outgoing
-  *commands* don't.
+- Any Saga replies (`*.events` topics) payment-service/shipping-service
+  publish should go through an outbox from the start, same as
+  order-service's `order.events` and inventory-service's
+  `inventory.events` already do. (The historical gap where
+  order-service's outgoing Saga *commands* bypassed the outbox — see
+  Phase 2's original Javadoc excerpt — has since been closed; see
+  "Post-Phase 3 hardening — routing Saga commands through the outbox"
+  above. If payment-service/shipping-service ever need to send their own
+  outgoing commands, route them through the outbox from the start rather
+  than repeating that now-fixed mistake.)
 - Pick a `server.port` for each new service before running multiple
   services simultaneously outside Docker (order-service = 8082,
   inventory-service = 8083; payment-service and shipping-service should
