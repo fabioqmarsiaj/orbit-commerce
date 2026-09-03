@@ -860,6 +860,80 @@ correct/tested.
 
 ---
 
+## Phase 5 — shipping-service
+
+### No natural business field to key a success/failure simulation on
+Unlike inventory-service (checks actual stock quantity from
+`ReserveStockCommand.items`) and payment-service (compares
+`ProcessPaymentCommand.amountCents` against a configurable threshold),
+`CreateShipmentCommand`'s schema carries only `eventId`/`orderId`/
+`customerId`/`occurredAt` — no amount, no items, no address, nothing
+resembling a business quantity a "should this fail" rule could
+plausibly hang off of. Confirmed by checking both the Avro schema and
+`order-service`'s `SagaCommandFactory#createShipment`, which deliberately
+builds the command from just `order.getId()`/`order.getCustomerId()`
+(unlike `reserveStock`/`releaseStock`, which do include line items, or
+`processPayment`/`refundPayment`, which do include the amount).
+
+**Fix: a sentinel `customerId` forces a simulated failure.**
+`shipping.simulation.force-fail-customer-id` in `application.properties`
+(default `fail-customer`) — `ShippingCommandService` compares the
+incoming command's `customerId` against this value; an exact match
+simulates `ShipmentFailed`, everything else simulates `ShipmentCreated`.
+This gives the same testing ergonomics as inventory-service's
+"request more than available" and payment-service's "request above the
+limit": deterministic, per-request control over which path executes
+(just supply the sentinel `customerId` in `POST /orders`), no service
+restart needed to switch between testing the happy path and the
+compensation path. Two alternatives were considered and rejected: a
+random failure-rate percentage (not deterministic — could require
+several attempts to actually hit the failure path during a manual test)
+and a global boolean config flag (affects every order uniformly, would
+require restarting the service to toggle between testing scenarios).
+
+### `ShipmentEntity` is audit/query only, not load-bearing — same role as inventory-service's `stock_reservations`
+Contrast with payment-service's `PaymentEntity`, which is genuinely
+load-bearing (a later `RefundPaymentCommand` needs to look up the
+`paymentId` generated on approval, since the command itself doesn't
+carry it back). There is no compensating command that flows INTO
+shipping-service at all — no `CancelShipmentCommand` exists in this
+Saga's design. A shipment failure is terminal and handled entirely by
+order-service compensating payment/inventory instead (see
+`OrderCommandService#handleShipmentFailed`, which sends both
+`RefundPaymentCommand` and `ReleaseStockCommand`, never anything back to
+shipping-service). So `ShipmentEntity` exists purely so
+`GET /shipments/{orderId}` has something to return, and as the natural
+place to hang future idempotent-consumption logic (deferred, same as
+every other service's P1 "Idempotent consumption" item) — nothing in
+the Saga's correctness depends on this table.
+
+### Milestone: the full Saga was manually verified end-to-end for the first time
+With all four participant services now implemented, both remaining
+untested Saga paths were exercised for real:
+- **Full happy path**: `POST /orders` → `STOCK_RESERVED` → stock
+  decremented → `PAYMENT_APPROVED` → `ShipmentCreated` published →
+  order reaches `COMPLETED`. This is the first time an order has ever
+  reached its terminal success state in this project.
+- **Shipment failure → dual compensation**: `POST /orders` with the
+  sentinel `customerId` → order proceeds normally through stock
+  reservation and payment approval, then `ShipmentFailed` is published →
+  `order-service`'s `handleShipmentFailed` fires BOTH
+  `RefundPaymentCommand` and `ReleaseStockCommand` (via the outbox, one
+  transaction, per the post-Phase-3 hardening) → payment-service marks
+  the payment `REFUNDED` → inventory-service releases the stock back →
+  order reaches `FAILED`. Confirmed directly in each service's database:
+  `payment_db.payments.status = REFUNDED` and `inventory_db.stock`
+  restored to its pre-reservation quantity. This is the first time two
+  independent compensating actions have been triggered from a single
+  domain event and both verified to complete correctly.
+
+This closes out everything Phase 6 ("End-to-end Saga") had listed as
+P0 except documenting Mermaid sequence diagrams — the actual
+verification work is done; Phase 6 as a checklist item is now mostly a
+documentation pass, not new testing.
+
+---
+
 ## Cross-cutting notes for Phase 5+ (shipping-service, query-service, and beyond)
 
 Things established in Phases 2-4 (and the post-Phase-3/4 fixes) that

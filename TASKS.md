@@ -221,25 +221,52 @@ on every listener of that topic, with no exceptions. See
 topic needs its own @KafkaHandler") for the full incident writeup.
 
 ## Phase 5 — shipping-service
-- [ ] P0 Spring Boot 4 + Postgres setup (shipping_db)
-- [ ] P0 `CreateShipmentCommand` consumer → simulates shipment creation (can be forced to
-      fail to test compensation) → ShipmentCreated/ShipmentFailed via outbox
+- [x] P0 Spring Boot 4 + Postgres setup (shipping_db) — `server.port=8085`
+- [x] P0 `CreateShipmentCommand` consumer → simulates shipment creation (forced to fail via
+      a sentinel `customerId`, `shipping.simulation.force-fail-customer-id`, to test
+      compensation) → ShipmentCreated/ShipmentFailed via outbox — `ShippingCommandListener`
+      + `ShippingCommandService`
 - [ ] P1 Idempotent consumption
 - [ ] P1 Integration tests (Testcontainers)
 
-Same notes as Phase 4 apply: depend on `outbox-support`, remember the
-entity/repository scan widening, and set `RecordNameStrategy` from the
-start. Also verify `order-service`'s `ShippingEventListener` already
-covers both `ShipmentCreated`/`ShipmentFailed` before assuming it's
-correct (it does, as of Phase 2) — see the post-Phase-4 `@KafkaHandler`
-completeness bug above.
+Depends on `outbox-support` from the start, same as Phase 4. `CreateShipmentCommand`
+carries no business field (amount, items) to key a realistic pass/fail decision on
+— unlike inventory-service's stock check or payment-service's amount threshold — so
+a sentinel `customerId` is used instead, giving the same deterministic per-request
+test control. `ShipmentEntity` (keyed by `orderId`) is audit/query only, not
+load-bearing: unlike payment-service's `PaymentEntity`, there is no compensating
+command that flows back into shipping-service (a shipment failure is terminal;
+order-service compensates payment/inventory directly, never asks shipping-service
+to undo anything). See `docs/decisions.md` ("Phase 5 — shipping-service") for the
+full design writeup.
+
+Manually verified — the full Saga, end-to-end, for the first time:
+- **Happy path**: `POST /orders` → stock reserved → payment approved →
+  `ShipmentCreated` published → order reaches `COMPLETED`.
+- **Shipment failure → dual compensation**: `POST /orders` with the sentinel
+  `customerId` → order proceeds through stock reservation and payment approval,
+  then `ShipmentFailed` triggers BOTH `RefundPaymentCommand` and
+  `ReleaseStockCommand` in the same transaction (via the outbox) → payment marked
+  `REFUNDED`, stock released back → order reaches `FAILED`. Confirmed directly in
+  `payment_db.payments` and `inventory_db.stock`.
 
 ## Phase 6 — End-to-end Saga
-- [ ] P0 Validate full happy path (order → stock → payment → shipping → completed)
-- [ ] P0 Validate compensation: stock rejected → order cancelled
-- [ ] P0 Validate compensation: payment declined → stock released → order cancelled
-- [ ] P0 Validate compensation: shipment failure → refund + stock release → order failed
+- [x] P0 Validate full happy path (order → stock → payment → shipping → completed)
+      — verified in Phase 5 above
+- [x] P0 Validate compensation: stock rejected → order cancelled — verified in
+      Phase 3
+- [x] P0 Validate compensation: payment declined → stock released → order cancelled
+      — verified in Phase 4
+- [x] P0 Validate compensation: shipment failure → refund + stock release → order
+      failed — verified in Phase 5 above
 - [ ] P1 Document sequence diagrams (Mermaid) for the 4 scenarios above
+
+All four P0 verification scenarios are now done — each was validated manually,
+end-to-end, against real running services as the corresponding participant service
+was implemented, rather than deferred to a separate dedicated testing phase. What
+remains for this phase is purely the P1 documentation task (Mermaid sequence
+diagrams) — worth revisiting once Phase 7-8 are done and the full picture is
+stable, or as part of Phase 10 polish.
 
 ## Phase 7 — query-service (CQRS + Kafka Streams)
 - [ ] P0 Spring Boot 4 + Postgres setup (query_db, read model)
