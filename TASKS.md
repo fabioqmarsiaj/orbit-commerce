@@ -338,14 +338,44 @@ for the full writeup — this pattern (`NewTopic` bean per Streams source topic)
 should be reused for any future service adding its own Kafka Streams topology.
 
 ## Phase 8 — ingestion-service (Go)
-- [ ] P0 Go project setup (kafka-go or confluent-kafka-go)
-- [ ] P0 Activity event generator (ProductViewed, AddedToCart, SearchPerformed) using a
-      worker pool/goroutines to simulate high volume
-- [ ] P0 Avro serialization compatible with Schema Registry, publishing to
-      `user-activity.events`
-- [ ] P1 Simple HTTP endpoint (e.g. `/health`, `/stats`) using net/http or chi
-- [ ] P1 Configuration via env vars (event rate, worker count)
-- [ ] P2 Go unit tests (table-driven tests)
+- [x] P0 Go project setup (kafka-go or confluent-kafka-go) — `segmentio/kafka-go`
+      (pure Go, no cgo) + `hamba/avro/v2` (not `goavro`, deprecated by its own
+      maintainer in favor of hamba/avro)
+- [x] P0 Activity event generator (ProductViewed, AddedToCart, SearchPerformed) using a
+      worker pool/goroutines to simulate high volume — `internal/activity.Generator`
+      (session-correlated funnel: search -> view -> maybe cart) +
+      `internal/worker.Pool` (goroutine pool, shared aggregate rate limiter)
+- [x] P0 Avro serialization compatible with Schema Registry, publishing to
+      `user-activity.events` — `internal/schema.Registrar` (RecordNameStrategy,
+      same as every Java producer) + `internal/producer.EncodeConfluentWire`
+      (hand-rolled Confluent wire format: magic byte + schema ID + Avro binary)
+- [x] P1 Simple HTTP endpoint (e.g. `/health`, `/stats`) using net/http or chi —
+      `internal/httpapi` (net/http alone, `http.ServeMux` method routing)
+- [x] P1 Configuration via env vars (event rate, worker count) — already scaffolded
+      in Phase 0's `internal/config`, extended with `HTTP_PORT`
+- [x] P2 Go unit tests (table-driven tests) — `internal/activity/generator_test.go`
+      (funnel invariants: at least 1 view/session, shared sessionId, AddedToCart
+      always references an already-viewed product, weighted type distribution) +
+      `internal/producer/encode_test.go` (Confluent wire-format round-trip)
+
+ingestion-service is architecturally different from every Java service: it never
+participates in the Saga and has no outbox/retry mechanism of its own — a failed
+publish is logged and counted (`GET /stats`'s `publishErrors`), not retried. This
+is a deliberate, documented asymmetry with the rest of the project (simulated,
+best-effort traffic has no domain state to keep consistent), not an oversight.
+
+Manually verified end-to-end: `go run ./cmd/ingestion-service` against the Phase 1
+Docker Compose stack registered all 3 `user-activity.events` schemas with Schema
+Registry, and published messages whose count exactly matched Kafka's own reported
+partition offsets. Running `query-service` (Phase 7 Part B) against this real
+traffic — the first time that Kafka Streams topology ever processed real data —
+immediately surfaced a real `ClassCastException` bug in `UserActivityStreamsConfig`
+(`GenericRecord#get` returns Avro's `Utf8` wrapper for string fields, not
+`java.lang.String`; fixed by using `.toString()` instead of an unchecked cast).
+After the fix, `GET /analytics/top-products` returned real, non-empty results for
+the first time. See `docs/decisions.md` ("Phase 8 — ingestion-service") for the
+full design writeup, including the library choices (hamba/avro/v2 vs goavro,
+kafka-go vs confluent-kafka-go) and the bug investigation.
 
 ## Phase 9 — Observability
 - [ ] P1 Micrometer + Prometheus on all Spring services

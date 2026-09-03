@@ -1132,6 +1132,195 @@ plain `@KafkaListener` consumers.
 
 ---
 
+## Phase 8 — ingestion-service (Go)
+
+### Library choices: hamba/avro/v2, segmentio/kafka-go, net/http, no cgo
+The Phase 0 scaffold had picked no libraries yet, only `go.mod` +
+`internal/config`. Three choices worth recording, each verified against
+the actual package docs before committing to it (not from memory/habit):
+- **`hamba/avro/v2`** for Avro, not `goavro` (the more historically
+  well-known option) — `goavro`'s own README states LinkedIn (its
+  maintainer) has internally moved to `hamba/avro` for performance and
+  no longer actively develops `goavro`. `hamba/avro` also supports typed
+  Go structs with `avro:"..."` tags (including automatic
+  `long`/`timestamp-millis` <-> `time.Time` conversion), letting
+  `internal/schema`'s `ProductViewed`/`AddedToCart`/`SearchPerformed`
+  structs mirror their `.avsc` fields directly — `goavro` only ever
+  decodes into `map[string]interface{}`, needing more manual code.
+- **`segmentio/kafka-go`**, not `confluent-kafka-go` — the latter is a
+  cgo wrapper around the C library `librdkafka`, requiring a working C
+  toolchain to build; `kafka-go` is pure Go, avoiding any such
+  complication on this Windows dev machine.
+- **`net/http` alone**, no router library (e.g. `chi`) — `internal/httpapi`
+  only ever needs two routes (`GET /health`, `GET /stats`), for which
+  Go 1.22+'s built-in `http.ServeMux` method-pattern routing
+  (`mux.HandleFunc("GET /health", ...)`) is already sufficient.
+
+### The 3 user-activity.events Avro schemas are duplicated into the Go module, not shared
+`event-schemas/src/main/avro/useractivity/*.avsc` (the canonical
+schemas every Java service ultimately generates its Avro classes from)
+live outside `ingestion-service`'s own module tree, and Go's
+`go:embed` can only embed files within the importing package's own
+module — there's no equivalent to Gradle's cross-module
+`project(":event-schemas")` dependency here. Rather than reading the
+files from a relative filesystem path (which would only work if the
+binary is always run from a fixed location relative to the monorepo
+root — fragile, especially for any future containerized deployment),
+the 3 `.avsc` files were copied verbatim into
+`ingestion-service/internal/schema/avro/` and embedded via `go:embed`.
+This is a deliberate, documented duplication, not an oversight: if the
+upstream schemas in `event-schemas/` ever change, these 3 copies need
+updating by hand to match. Since `user-activity.events`' schemas have
+been stable since Phase 0 and have no consumer-side compatibility
+concerns of their own (Schema Registry is still the actual source of
+truth at runtime — see below), this tradeoff was accepted for
+simplicity over introducing any kind of build-time schema-sync step.
+
+### Schemas are registered with Schema Registry at startup, using RecordNameStrategy — same as every Java producer
+`internal/schema.Registrar.RegisterAll` calls Schema Registry's
+`CreateSchema` (idempotent — registering an already-registered,
+unchanged schema just returns its existing ID) once per event type at
+process startup, before the worker pool starts publishing — a
+config/connectivity problem with Schema Registry then fails loudly and
+immediately (`log.Fatalf`), not confusingly deep inside a worker
+goroutine's first publish attempt.
+
+Each event type is registered under its own subject, named after the
+Avro record's fully-qualified name (e.g.
+`com.fabioqmarsiaj.events.useractivity.ProductViewed`) — this is
+`RecordNameStrategy`, matching every other multi-type topic in this
+project (`order.events`, `inventory.events`, etc. — see Phase 3's
+"Multi-type Kafka topics break Schema Registry compatibility checks
+under the default subject strategy"). `user-activity.events` is
+exactly this shape: 3 structurally unrelated record types sharing one
+topic. Verified live: `GET http://localhost:8081/subjects` after
+running ingestion-service shows all 3
+`com.fabioqmarsiaj.events.useractivity.*` subjects registered alongside
+every existing Java-service subject.
+
+### Hand-rolled Confluent wire-format encoding (magic byte + schema ID + Avro binary)
+`hamba/avro/v2` encodes/decodes raw Avro binary; it does not itself
+implement Confluent's wire format (the extra framing every Java service
+in this project already produces/consumes via `KafkaAvroSerializer`/
+`KafkaAvroDeserializer`, and that `query-service`'s `GenericAvroSerde`
+expects to read). `internal/producer/encode.go`'s
+`EncodeConfluentWire` does this by hand: 1 magic byte (`0x0`) + a
+4-byte big-endian schema ID + the Avro binary payload — matching the
+format documented at
+https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format.
+Verified via a round-trip unit test (`encode_test.go`, no live Schema
+Registry needed — it parses the embedded schema JSON directly and
+decodes the produced wire bytes back into the original struct) and,
+more importantly, live: `query-service`'s existing
+`KafkaAvroDeserializer`/`GenericAvroSerde` machinery (Phase 7)
+successfully deserialized real messages produced by ingestion-service
+with no changes needed on the consumer side, confirming the hand-rolled
+encoder produces byte-for-byte-compatible output.
+
+### Session-correlated funnel generation, not independent random events
+`internal/activity.Generator.GenerateSession` deliberately models one
+simulated *session* at a time (search -> view 1-3 products -> maybe add
+one viewed product to cart), all sharing one `sessionId`, rather than
+generating each event type independently at random. Two reasons this
+matters:
+1. **Realism** — a real shopper's activity is causally connected
+   (you only add to cart something you viewed), which a purely
+   independent per-event generator can't represent (nothing would stop
+   it from emitting an `AddedToCart` for a product that was never
+   `ProductViewed` in the same session).
+2. **Interesting analytics output** — `query-service`'s "top viewed
+   products" Kafka Streams topology (Phase 7 Part B) benefits from
+   input that has actual funnel shape (views >> carts, weighted product
+   popularity) rather than a flat 1/3 split across event types, which
+   would make the resulting counts look like noise.
+
+Weights (`searchProbability = 0.40`, `addToCartProbability = 0.20`,
+1-3 `ProductViewed` per session) were chosen to approximate a plausible
+e-commerce funnel, not derived from any real data — this is simulated
+traffic. `sessionId` doubles as the Kafka message key (`Publisher`'s
+`keyOf`), keeping every event from one session on the same partition
+and in relative order, the same "key by the aggregate the events are
+about" convention used for every other topic in this project (orderId,
+productId, etc.).
+
+### Fixed, self-contained fake product catalog — deliberately not sourced from inventory-service
+`internal/activity/catalog.go` hardcodes ~25 fake product IDs
+(`sku-1`..`sku-25`). inventory-service's real `productId`s are created
+ad hoc via `POST /stock` during manual testing, with no fixed list or
+listing endpoint to query — coupling ingestion-service to
+inventory-service's runtime state would add a real dependency this
+simulation doesn't need (Phase 7 Part B's analytics only cares about
+counting views per `productId` string, not about that product actually
+existing in a Saga). Kept the two completely decoupled on purpose.
+
+### No outbox/retry for ingestion-service's publishes — an intentional asymmetry with the rest of the project
+Every other Kafka producer in this project (order-service,
+inventory-service, payment-service, shipping-service) routes every
+publish through the Outbox pattern (`outbox-support`) for
+crash-safe, at-least-once delivery — because those events/commands
+drive the Saga forward, and losing one silently corrupts a real
+business process. ingestion-service has no such requirement: its
+output is simulated, best-effort traffic with no downstream Saga
+participation and no domain state of its own to keep consistent with
+an "intent to publish". `producer.Publisher.Publish` simply returns
+its error to the caller; `internal/worker.Pool.runOne` logs it and
+increments `stats.Counters.publishErrors`, then moves on to the next
+event — no retry, no outbox row, no dead-letter handling. This is a
+deliberate, documented choice, not an oversight inconsistent with the
+rest of the project's at-least-once guarantees.
+
+### Aggregate (not per-worker) rate limiting via a single shared golang.org/x/time/rate.Limiter
+`config.Config.EventsPerSecond` (default 50) is documented in
+TASKS.md as simulating "high volume" overall, not per goroutine — so
+`worker.Pool` creates exactly one `rate.Limiter`, shared across all
+`WorkerCount` (default 4) goroutines, rather than one limiter per
+worker (which would have made the real aggregate throughput
+`WorkerCount * EventsPerSecond`, silently decoupling the env var's
+documented meaning from its actual effect). Burst is set equal to the
+rate itself, allowing up to one second's worth of events to fire back
+to back after any idle period — a reasonable default with no external
+SLA to honor more precisely.
+
+### Manually verified end-to-end, including a real bug found in query-service by real traffic
+Ran standalone first: `go run ./cmd/ingestion-service` against the
+Phase 1 Docker Compose stack (no other service running) confirmed
+`GET /health` returns 200, `GET /stats` shows growing per-type counters
+matching Kafka UI's view of `user-activity.events`' partition offsets
+exactly (24 messages published in ~6s at `EVENTS_PER_SECOND=20` matched
+`kafka-get-offsets.sh`'s reported total across all 3 partitions,
+byte-for-byte), and Schema Registry's `/subjects` endpoint shows all 3
+new subjects registered under `RecordNameStrategy` alongside every
+existing Java-service subject.
+
+Running `query-service` (`:query-service:bootRun`) at the same time
+against this real traffic — the very first time Phase 7 Part B's Kafka
+Streams topology ever processed a real `user-activity.events` message,
+since Part B had previously only ever been verified by compilation
+(see "Phase 7 — query-service (Part B: Kafka Streams analytics)" above)
+— immediately surfaced a real bug: `UserActivityStreamsConfig`'s
+`.map((key, value) -> KeyValue.pair((String) value.get("productId"), value))`
+threw `ClassCastException: class org.apache.avro.util.Utf8 cannot be
+cast to class java.lang.String` on every single message. Root cause: a
+`GenericRecord`'s `get(fieldName)` returns Avro's own
+`org.apache.avro.util.Utf8` wrapper type for Avro `"string"` fields by
+default, not `java.lang.String` — a direct `(String)` cast compiles
+fine (the cast is unchecked at compile time) but always fails at
+runtime once real data flows through. Fixed by calling `.toString()`
+instead of casting (works for both `Utf8` and, defensively, `String`
+itself, so it stays correct even if the value serde's string handling
+ever changes) — see `UserActivityStreamsConfig.java`'s inline comment
+for the fix itself. After the fix, `GET /analytics/top-products`
+against `query-service` returned real, non-empty
+`{productId, viewCount}` results for the first time, confirming the
+full pipeline (ingestion-service -> user-activity.events -> Kafka
+Streams tumbling-window count -> interactive query -> REST API) works
+end to end. This is exactly the kind of gap "verification by
+compilation only" (Phase 7 Part B's explicitly accepted limitation)
+couldn't have caught — a good illustration of why that limitation was
+called out at the time rather than silently assumed to be fine.
+
+---
+
 ## Cross-cutting notes for Phase 5+ (shipping-service, query-service, and beyond)
 
 Things established in Phases 2-4 (and the post-Phase-3/4 fixes) that

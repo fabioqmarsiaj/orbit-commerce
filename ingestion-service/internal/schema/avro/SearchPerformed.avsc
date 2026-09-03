@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "SearchPerformed",
+  "namespace": "com.fabioqmarsiaj.events.useractivity",
+  "fields": [
+    {"name": "eventId", "type": "string"},
+    {"name": "sessionId", "type": "string"},
+    {"name": "query", "type": "string"},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

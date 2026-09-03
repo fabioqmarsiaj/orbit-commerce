@@ -109,7 +109,18 @@ public class UserActivityStreamsConfig {
 
         return activity
                 .filter((key, value) -> value != null && "ProductViewed".equals(value.getSchema().getName()))
-                .map((key, value) -> KeyValue.pair((String) value.get("productId"), value))
+                // GenericRecord#get returns org.apache.avro.util.Utf8 for
+                // "string"-typed fields by default, NOT java.lang.String -
+                // a direct (String) cast throws ClassCastException at
+                // runtime (compiles fine, since the cast is unchecked at
+                // compile time). .toString() works for both Utf8 and
+                // String, so this stays correct even if the value serde's
+                // string handling ever changes. Found live via real
+                // ingestion-service (Phase 8) traffic - Part B had
+                // previously only ever been verified by compilation, with
+                // no real user-activity.events producer to catch this.
+                // See docs/decisions.md ("Phase 8 - ingestion-service").
+                .map((key, value) -> KeyValue.pair(value.get("productId").toString(), value))
                 .groupByKey()
                 .windowedBy(TimeWindows.ofSizeWithNoGrace(WINDOW_SIZE))
                 .count(Named.as(PRODUCT_VIEW_COUNTS_STORE + "-count"),
