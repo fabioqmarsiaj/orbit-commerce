@@ -934,6 +934,98 @@ documentation pass, not new testing.
 
 ---
 
+## Phase 7 — query-service (Part A: read model)
+
+query-service is architecturally different from every service built so
+far: it's a pure CQRS read-model consumer, not a Saga participant. It
+never publishes domain events, never sends Saga commands, and — unlike
+every other service — does NOT depend on `outbox-support` at all (that
+module's entire public API, `OutboxRecorder`/`AbstractOutboxPublisher`,
+is producer-side only; confirmed by inspection before starting this
+phase). Its `application.properties` has no `[Producer]` section, no
+`KafkaTemplate` bean is ever injected anywhere in this service, and its
+`@SpringBootApplication` needs no `scanBasePackages`/`@EntityScan`/
+`@EnableJpaRepositories` widening either — since it doesn't reach into
+`com.fabioqmarsiaj.outbox` (a sibling package), all of its own classes
+already live under its own base package, which Spring's default
+component/entity scan already covers.
+
+### Two read models, deliberately kept separate
+- **`TimelineEntryEntity`** (table `timeline_entries`) — append-only, one
+  row per domain event consumed across all FOUR `*.events` topics
+  (`order.events`, `inventory.events`, `payment.events`,
+  `shipping.events`). Structurally similar to order-service's
+  `OrderEventEntity` (same `Persistable<UUID>`, always-`isNew()`,
+  `columnDefinition = "TEXT"` payload shape) but conceptually different:
+  it has no authority of its own — it's a derived, denormalized,
+  cross-service view that could be dropped and rebuilt from scratch by
+  replaying the four topics from the beginning at any time (the
+  defining property of a CQRS read model, unlike an event-sourced
+  aggregate's own event store).
+- **`OrderSummaryEntity`** (table `order_summaries`, natural key
+  `orderId`) — one row per order, powering `GET /orders?status=`.
+  Projected EXCLUSIVELY from `order.events`, never from the other three
+  topics. This was a deliberate choice over a richer "live status" that
+  also promotes through `STOCK_RESERVED`/`PAYMENT_APPROVED` by listening
+  to `inventory.events`/`payment.events` too: since Kafka topics are
+  independent of each other, an event on e.g. `inventory.events` could
+  theoretically be consumed and processed before the corresponding
+  `OrderCreated` on `order.events` — projecting status from a SINGLE
+  topic (partitioned/ordered per `orderId`, like every topic in this
+  project) sidesteps that race entirely, at the cost of
+  `OrderSummaryStatus` only ever being able to represent
+  `CREATED`/`COMPLETED`/`CANCELLED`/`FAILED` — the four types
+  `order.events` actually carries — never the three intermediate
+  transitions. Those three ARE still fully visible, just via the
+  granular `TimelineEntryEntity`/`GET /orders/{id}/timeline` instead.
+
+### Avro payload → JSON payload, NOT via Avro's own JSON codec this time
+Every producer-side outbox writer in this project (order/inventory/
+payment/shipping-service, via `outbox-support`'s `OutboxRecorder`) uses
+Avro's own schema-aware JSON codec (`EncoderFactory`/`SpecificDatumWriter`)
+specifically because the stored payload later needs to be decoded back
+into a strongly-typed Avro `SpecificRecord` for republishing — and plain
+Jackson can't handle Avro's `getSchema()` bean-style getter. `query-service`'s
+`TimelineRecorder` is different: it never needs to reconstruct an Avro
+object from what it stores — the timeline API only ever deserializes
+the payload back into a generic `Map<String,Object>` (see
+`TimelineEntryResponse.from`). So `TimelineRecorder` builds a plain
+`Map<String,Object>` of just the fields worth showing (e.g.
+`Map.of("reason", event.getReason())`) in each listener, and serializes
+THAT with plain Jackson 3 (`tools.jackson.databind.ObjectMapper`, same
+Spring Boot 4 default noted since Phase 2) — no Avro codec involved at
+all on this side, since the Avro object itself is never what's being
+stored.
+
+### Manually verified end-to-end (Part A)
+Ran all 5 services together (order/inventory/payment/shipping/query)
+against real traffic from the already-established Saga scenarios:
+- **Happy path**: `POST /orders` → `GET /orders/{id}/timeline` on
+  query-service showed the full cross-topic event sequence
+  (`OrderCreated` → `StockReserved` → `PaymentApproved` →
+  `ShipmentCreated` → `OrderCompleted`); `GET /orders?status=COMPLETED`
+  correctly listed the order.
+- **Failure/compensation path**: verified similarly — the timeline
+  correctly showed the compensation events (e.g. `PaymentDeclined`/
+  `StockReleased`/`OrderCancelled`, or the shipment-failure variant with
+  both `RefundPaymentCommand`'s resulting `PaymentRefunded` and
+  `ReleaseStockCommand`'s resulting `StockReleased`), and
+  `GET /orders?status=` correctly reflected the terminal
+  `CANCELLED`/`FAILED` status.
+
+### Part B (Kafka Streams analytics) deferred to its own pass
+`query-service/build.gradle.kts` already had a bare
+`org.apache.kafka:kafka-streams` dependency pre-scaffolded (from initial
+repo setup, unused until now). Part A doesn't touch it — the Kafka
+Streams topology over `user-activity.events` (P1 in TASKS.md) and its
+`GET /analytics/top-products` endpoint are implemented separately, since
+there's no producer of `user-activity.events` yet (`ingestion-service`
+is Phase 8) — Part B can be implemented and will compile, but can't be
+manually verified with real traffic until Phase 8 exists. See the
+follow-up entry below once Part B lands.
+
+---
+
 ## Cross-cutting notes for Phase 5+ (shipping-service, query-service, and beyond)
 
 Things established in Phases 2-4 (and the post-Phase-3/4 fixes) that

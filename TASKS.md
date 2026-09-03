@@ -269,14 +269,45 @@ diagrams) — worth revisiting once Phase 7-8 are done and the full picture is
 stable, or as part of Phase 10 polish.
 
 ## Phase 7 — query-service (CQRS + Kafka Streams)
-- [ ] P0 Spring Boot 4 + Postgres setup (query_db, read model)
-- [ ] P0 Consumers for order.events/inventory.events/payment.events/shipping.events →
-      materialize order timeline (read model)
-- [ ] P0 REST API: `GET /orders/{id}/timeline`, `GET /orders?status=`
+- [x] P0 Spring Boot 4 + Postgres setup (query_db, read model) — `server.port=8086`
+- [x] P0 Consumers for order.events/inventory.events/payment.events/shipping.events →
+      materialize order timeline (read model) — `OrderEventListener`/
+      `InventoryEventListener`/`PaymentEventListener`/`ShippingEventListener` +
+      `TimelineRecorder`/`OrderSummaryProjector`
+- [x] P0 REST API: `GET /orders/{id}/timeline`, `GET /orders?status=`
 - [ ] P1 Kafka Streams topology over `user-activity.events`: tumbling window (1 min) of
       ProductViewed grouped by productId, count via state store
 - [ ] P1 Interactive query endpoint: `GET /analytics/top-products`
 - [ ] P2 Integration tests (Testcontainers, incl. Kafka Streams TopologyTestDriver)
+
+query-service is architecturally different from every prior service: a pure CQRS
+read-model consumer, never a Saga participant. It never publishes and does NOT
+depend on `outbox-support` (that module is producer-side only) — no
+`[Producer]` section in `application.properties`, no `@EntityScan`/
+`@EnableJpaRepositories` widening needed either, since it never reaches into the
+sibling `com.fabioqmarsiaj.outbox` package.
+
+Two separate read models: `TimelineEntryEntity` (append-only, one row per event
+across all 4 `*.events` topics) and `OrderSummaryEntity` (one row per order,
+projected EXCLUSIVELY from `order.events` to avoid a cross-topic race — so its
+4-value `OrderSummaryStatus` can't represent the 3 intermediate transitions
+`STOCK_RESERVED`/`PAYMENT_APPROVED`/`SHIPPED`, only `CREATED`/`COMPLETED`/
+`CANCELLED`/`FAILED`; those 3 remain fully visible via the granular timeline
+endpoint). `TimelineRecorder` serializes plain Jackson 3 JSON (a
+`Map<String,Object>` of just the fields worth showing), not Avro's own JSON
+codec like every outbox writer — the payload here is only ever read back as a
+generic map for the API response, never reconstructed into a typed Avro object.
+See `docs/decisions.md` ("Phase 7 — query-service (Part A: read model)") for the
+full design writeup.
+
+Manually verified end-to-end with all 5 services running: both the happy path
+and a failure/compensation path correctly show the full cross-topic event
+sequence via `GET /orders/{id}/timeline`, and `GET /orders?status=` correctly
+reflects each order's terminal status.
+
+Kafka Streams (Part B) is deferred to a separate implementation pass — see
+below once it lands; can't be manually verified with real traffic until
+ingestion-service (Phase 8) exists to actually produce `user-activity.events`.
 
 ## Phase 8 — ingestion-service (Go)
 - [ ] P0 Go project setup (kafka-go or confluent-kafka-go)
