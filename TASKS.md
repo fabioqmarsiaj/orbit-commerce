@@ -172,22 +172,53 @@ and reacts to `ReserveStockCommand`. See `docs/decisions.md`
 for the full writeup.
 
 ## Phase 4 — payment-service
-- [ ] P0 Spring Boot 4 + Postgres setup (payment_db)
-- [ ] P0 `ProcessPaymentCommand` consumer → simulates approval/decline (simple rule,
-      e.g. amount > limit = decline) → PaymentApproved/PaymentDeclined via outbox
-- [ ] P0 `RefundPaymentCommand` consumer (compensation) → PaymentRefunded
+- [x] P0 Spring Boot 4 + Postgres setup (payment_db) — `server.port=8084`
+- [x] P0 `ProcessPaymentCommand` consumer → simulates approval/decline (simple rule,
+      amountCents > `payment.approval.limit-cents` = decline) → PaymentApproved/
+      PaymentDeclined via outbox — `PaymentCommandListener` + `PaymentCommandService`
+- [x] P0 `RefundPaymentCommand` consumer (compensation) → PaymentRefunded
 - [ ] P1 Idempotent consumption
 - [ ] P1 Integration tests (Testcontainers)
 
-Depend on `outbox-support` (`implementation(project(":outbox-support"))`)
-from the start rather than reimplementing the outbox — see the
-post-Phase-3 refactor note above and `docs/decisions.md` for the exact
-shape (thin `OutboxWriter` + `OutboxPublisher extends
-AbstractOutboxPublisher`), and remember the `@EntityScan`/
-`@EnableJpaRepositories`/`scanBasePackages` widening this requires on
-`PaymentServiceApplication`. Also set
-`spring.kafka.producer.properties.value.subject.name.strategy=io.confluent.kafka.serializers.subject.RecordNameStrategy`
-from the start (Phase 3 Schema Registry bug — see above).
+Depends on `outbox-support` (`implementation(project(":outbox-support"))`)
+from the start, per the Phase 3 recommendation — thin `OutboxWriter` +
+`OutboxPublisher extends AbstractOutboxPublisher`, `@EntityScan`/
+`@EnableJpaRepositories`/`scanBasePackages` widened on
+`PaymentServiceApplication`, and `RecordNameStrategy` set from the start.
+
+`payments` table (`PaymentEntity`, keyed by `orderId`) is load-bearing,
+not just audit — `RefundPaymentCommand` doesn't carry the `paymentId`
+`PaymentApproved` generated, so it must be looked up. Both APPROVED and
+DECLINED outcomes are persisted. A refund for a payment that isn't
+currently APPROVED (missing, or already REFUNDED) is logged and skipped
+rather than publishing a possibly-incorrect `PaymentRefunded`. See
+`docs/decisions.md` ("Phase 4 — payment-service") for the full design
+writeup.
+
+Manually verified: happy path (`POST /orders` with amount under the
+limit) results in `PaymentApproved` and order-service sending
+`CreateShipmentCommand` next. The decline + compensation path (amount
+over the limit) surfaced a real bug — see below.
+
+### Post-Phase 4 fix: `@KafkaListener`s were missing a handler for their 3rd event type
+Testing the decline path for the first time (payment declined → order
+cancelled → stock released) was also the first time `StockReleased` was
+ever actually published in this project — and it wedged order-service's
+Kafka consumer: `InventoryEventListener`'s `@KafkaListener` had
+`@KafkaHandler` methods for `StockReserved`/`StockRejected` but not
+`StockReleased`, and an unhandled type throws `KafkaException: No method
+found` rather than being silently skipped (the class's own Javadoc,
+written in Phase 2, incorrectly claimed the latter) — with no custom
+error handler, the container retries the same offset forever, wedging
+the whole partition. `PaymentEventListener` had the identical latent bug
+for `PaymentRefunded`, not yet triggered live only because
+shipping-service doesn't exist yet. Fixed by adding a minimal
+(log-and-return) `@KafkaHandler` for both previously-missing event types,
+and rewriting both classes' Javadoc to state the rule explicitly: every
+publishable event type on a multi-type topic needs an explicit handler
+on every listener of that topic, with no exceptions. See
+`docs/decisions.md` ("Post-Phase 4 fix — every Kafka event type on a
+topic needs its own @KafkaHandler") for the full incident writeup.
 
 ## Phase 5 — shipping-service
 - [ ] P0 Spring Boot 4 + Postgres setup (shipping_db)
@@ -198,7 +229,10 @@ from the start (Phase 3 Schema Registry bug — see above).
 
 Same notes as Phase 4 apply: depend on `outbox-support`, remember the
 entity/repository scan widening, and set `RecordNameStrategy` from the
-start.
+start. Also verify `order-service`'s `ShippingEventListener` already
+covers both `ShipmentCreated`/`ShipmentFailed` before assuming it's
+correct (it does, as of Phase 2) — see the post-Phase-4 `@KafkaHandler`
+completeness bug above.
 
 ## Phase 6 — End-to-end Saga
 - [ ] P0 Validate full happy path (order → stock → payment → shipping → completed)

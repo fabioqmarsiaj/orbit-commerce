@@ -727,10 +727,157 @@ replying with events, never issuing further commands downstream).
 
 ---
 
-## Cross-cutting notes for Phase 4+ (payment-service, shipping-service, and beyond)
+## Phase 4 — payment-service
 
-Things established in Phases 2-3 (and the post-Phase-3 refactor) that
+### `PaymentEntity`: load-bearing state, not just an audit trail
+Unlike inventory-service's `stock_reservations` table (pure audit — the
+compensating `ReleaseStockCommand` already carries every line item
+needed, so nothing actually depends on reading that table back),
+payment-service's `payments` table is load-bearing. The
+`RefundPaymentCommand` Avro schema carries only `orderId` and
+`amountCents` — NOT the `paymentId` that payment-service itself generates
+when a payment is approved (`PaymentApproved.paymentId`). Without
+persisting that `paymentId` (and the fact that a payment was ever
+approved for this order in the first place) somewhere, a later refund
+command would have no way to know whether refunding is even valid, or
+what payment it's supposedly refunding.
+
+`PaymentEntity` is keyed by `orderId` directly (a natural key — at most
+one payment attempt per order in this simplified simulation), same
+`Persistable<UUID>` + `@Transient isNew` treatment as every other
+non-null-at-construction `@Id` in this project. Both `APPROVED` and
+`DECLINED` outcomes get a row (not just approvals) — needed for the
+`GET /payments/{orderId}` endpoint to give a complete picture, and
+because `DECLINED` rows are only ever read, never looked up as the
+target of a future refund (a refund command for a `DECLINED`/nonexistent
+payment is handled defensively — see below — so persisting `DECLINED`
+rows doesn't complicate that check, it just makes the read side more
+useful).
+
+### Approval rule is a configurable amount threshold, not hardcoded
+`payment.approval.limit-cents` in `application.properties`
+(`PaymentCommandService` reads it via `@Value`) — amounts above the limit
+are declined, everything else approved. Deliberately simple (this is a
+simulation, not a real payment gateway integration), but configurable
+specifically so the decline path can be forced during manual testing by
+temporarily lowering the limit, without recompiling — the same
+"observable both ways" testing approach used for inventory-service's
+insufficient-stock rejection path in Phase 3.
+
+### Refund for a payment that isn't `APPROVED`: log and skip, don't publish
+`PaymentCommandService.handleRefundPayment` looks up the `PaymentEntity`
+by `orderId` and, if it's missing OR not currently `APPROVED` (e.g.
+already `REFUNDED`, or the payment was actually `DECLINED` and this
+refund command shouldn't logically exist), logs a warning and returns
+without persisting anything or writing to the outbox. This is a
+defensive branch, not expected to trigger given the Saga's design — but
+Kafka only guarantees at-least-once delivery, so a duplicate or
+theoretically out-of-order redelivery isn't impossible. The alternative
+(publish `PaymentRefunded` anyway, "best effort") was considered and
+rejected: it would mean order-service could receive a refund
+confirmation for a payment that was never actually taken, which is worse
+than simply not confirming a refund that shouldn't have been requested.
+
+---
+
+## Post-Phase 4 fix — every Kafka event type on a topic needs its own `@KafkaHandler`
+
+### The bug: `KafkaException: No method found`, and a permanently wedged partition
+Discovered live during Phase 4 manual testing — the FIRST time the Saga's
+compensation path (payment declined → release stock) was ever actually
+exercised end-to-end (inventory/payment-service didn't exist yet when
+this path was written in Phase 2, so it had never been run for real).
+The moment inventory-service published a real `StockReleased` event,
+order-service's `InventoryEventListener` blew up:
+```
+org.springframework.kafka.KafkaException: No method found for class com.fabioqmarsiaj.events.inventory.StockReleased
+```
+followed by the container endlessly re-seeking to the same offset
+("Record in retry and not yet recovered") until backoff attempts were
+exhausted, at which point the whole partition for that consumer group
+was stuck — no further messages on that partition would ever be
+processed until the process was fixed and restarted.
+
+The root cause: `InventoryEventListener`'s class-level `@KafkaListener` +
+method-level `@KafkaHandler` combination had `@KafkaHandler` methods for
+`StockReserved` and `StockRejected`, but NOT `StockReleased` — the third
+event type `inventory.events` carries. The class's own Javadoc, written
+in Phase 2, incorrectly claimed this was safe: *"A message type without a
+matching handler ... is simply not delivered to this listener."* That
+claim was never actually tested until now, and it's wrong: Spring Kafka's
+`DelegatingInvocableHandler` throws when it can't find a matching method,
+it doesn't silently skip the message. Without a message-specific error
+handler configured to skip-and-continue, the container's default
+behavior for a listener exception is to retry the SAME record
+indefinitely (with backoff) — which is the correct, safe default for
+genuinely transient failures, but catastrophic for what is actually a
+permanent "this type will never be handled" programming error: the
+record can never succeed no matter how many times it's retried, so the
+partition is effectively dead until a human intervenes.
+
+`PaymentEventListener` had the identical latent bug for
+`PaymentRefunded` (the third event type on `payment.events`) — not yet
+triggered live only because shipping-service (Phase 5) doesn't exist
+yet, so `handleShipmentFailed` (the only path that sends
+`RefundPaymentCommand`) was never reachable end-to-end. Fixed
+proactively alongside the `StockReleased` fix rather than waiting to
+rediscover the same bug in Phase 5.
+
+### The fix: a `@KafkaHandler` for every publishable event type, even if it's just a log line
+Both listeners gained a handler for their previously-missing third event
+type. Since order-service genuinely has nothing further to DO in
+reaction to a compensation acknowledgment (the order is already in a
+terminal state — `CANCELLED`/`FAILED` — by the time `StockReleased`/
+`PaymentRefunded` arrives), the new handlers are intentionally minimal —
+just consume the message and log that the Saga ends here for this
+branch, which is exactly what's needed to let the partition offset
+advance normally.
+```java
+@KafkaHandler
+public void onStockReleased(StockReleased event) {
+    UUID orderId = UUID.fromString(event.getOrderId());
+    log.info("Order {}: stock released (compensation ack) - Saga ends here for this branch", orderId);
+}
+```
+Both classes' Javadoc was rewritten to describe the ACTUAL Spring Kafka
+behavior (throws and wedges the partition, doesn't silently skip) and to
+state explicitly, as a rule for future maintainers: **every publishable
+event type on a multi-type topic needs a matching `@KafkaHandler` on
+every listener of that topic, with no exceptions** — even a
+"deliberately ignored" event type needs an explicit (if trivial) handler,
+never an absent one.
+
+### General lesson for Phase 5+ (and any future `@KafkaListener` on a multi-type topic)
+Before adding or reviewing any class-level `@KafkaListener` +
+`@KafkaHandler` listener, cross-check its topic's FULL set of publishable
+Avro types (consult the relevant `event-schemas` directory and every
+service that publishes to that topic) against the listener's
+`@KafkaHandler` methods — a compile-time-invisible gap here doesn't fail
+loudly until the exact message type that's missing a handler actually
+gets published for the first time, which as this bug shows can be a long
+time after the listener was originally written and believed to be
+correct/tested.
+
+---
+
+## Cross-cutting notes for Phase 5+ (shipping-service, query-service, and beyond)
+
+Things established in Phases 2-4 (and the post-Phase-3/4 fixes) that
 will likely recur:
+
+- **Every `@KafkaListener`/`@KafkaHandler` combo must have a handler for
+  EVERY publishable event type on that topic** — even ones the listener
+  has nothing to do in response to (a minimal log-and-return handler is
+  fine, an absent one is not). An unhandled type doesn't get silently
+  skipped, it throws `KafkaException: No method found` and wedges the
+  partition for that consumer group until fixed. See "Post-Phase 4 fix"
+  above for the full incident (this bit `StockReleased` in Phase 4, live,
+  the first time compensation was ever actually exercised end-to-end).
+  When shipping-service starts publishing `ShipmentCreated`/
+  `ShipmentFailed`, double check `ShippingEventListener` already covers
+  both (it does, as of Phase 2) — and if shipping-service or query-service
+  end up listening to any OTHER multi-type topic later, apply this check
+  there too before considering that listener done.
 
 - **Depend on `outbox-support` (`implementation(project(":outbox-support"))`),
   don't reimplement the outbox.** payment-service and shipping-service
