@@ -110,6 +110,185 @@ services:
     networks:
       - orbit-net
 
+  # ---------------------------------------------------------------
+  # Phase 9: the 5 Java services, dockerized. All under the `apps`
+  # Compose profile — plain `docker compose up -d` (today's exact
+  # command) keeps bringing up ONLY the infra above, zero change to the
+  # established bootRun-based dev workflow. `docker compose --profile
+  # apps up -d --build` brings up everything, apps included, for
+  # end-to-end observability testing. ingestion-service (Go) stays
+  # undockerized this phase — see docs/decisions.md ("Phase 9 —
+  # Observability").
+  # ---------------------------------------------------------------
+
+  order-service:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    container_name: orbit-order-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP: broker:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - orbit-net
+
+  inventory-service:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: inventory-service/Dockerfile
+    container_name: orbit-inventory-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP: broker:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - orbit-net
+
+  payment-service:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: payment-service/Dockerfile
+    container_name: orbit-payment-service
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP: broker:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - orbit-net
+
+  shipping-service:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: shipping-service/Dockerfile
+    container_name: orbit-shipping-service
+    ports:
+      - "8085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP: broker:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - orbit-net
+
+  query-service:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: query-service/Dockerfile
+    container_name: orbit-query-service
+    ports:
+      - "8086:8086"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP: broker:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - orbit-net
+
+  # ---------------------------------------------------------------
+  # Phase 9: observability stack (Prometheus, Grafana, kafka-exporter).
+  # Also under the `apps` profile — a Prometheus instance with no Java
+  # services running has nothing useful to scrape (all targets DOWN), so
+  # it makes more sense bundled with the apps themselves. `docker compose
+  # --profile apps up -d --build` is the single command that brings up
+  # the entire observable system. See docs/decisions.md ("Phase 9 —
+  # Observability").
+  # ---------------------------------------------------------------
+
+  prometheus:
+    profiles: ["apps"]
+    image: prom/prometheus:v3.14.0
+    container_name: orbit-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      order-service:
+        condition: service_started
+      inventory-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      shipping-service:
+        condition: service_started
+      query-service:
+        condition: service_started
+    networks:
+      - orbit-net
+
+  kafka-exporter:
+    profiles: ["apps"]
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: orbit-kafka-exporter
+    command: ["--kafka.server=broker:19092"]
+    ports:
+      - "9308:9308"
+    depends_on:
+      broker:
+        condition: service_healthy
+    networks:
+      - orbit-net
+
+  grafana:
+    profiles: ["apps"]
+    image: grafana/grafana:13.2.1
+    container_name: orbit-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - orbit-net
+
 networks:
   orbit-net:
     name: orbit-commerce-net

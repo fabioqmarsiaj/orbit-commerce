@@ -1,0 +1,14 @@
+# Phase 9: Grafana datasource provisioning-as-code — auto-loaded on
+# startup, no manual UI setup needed. Points at the `prometheus` service's
+# in-network DNS name (both containers share `orbit-net` under the `apps`
+# Compose profile).
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -1,0 +1,57 @@
+# Phase 9: build context = repo root for every service's Dockerfile (monorepo
+# multi-module Gradle build — each service depends on :event-schemas/
+# :outbox-support at the root, so Docker needs to see the whole tree). This
+# file keeps that context small by excluding everything no Dockerfile's
+# `build` stage actually needs to run `./gradlew :service-name:bootJar`.
+
+# ---- Git ----
+.git/
+.gitignore
+.gitattributes
+
+# ---- Gradle / Java build output ----
+.gradle/
+**/build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+HELP.md
+
+# ---- Go (ingestion-service is not dockerized this phase) ----
+ingestion-service/bin/
+ingestion-service/*.exe
+ingestion-service/*.test
+ingestion-service/*.out
+
+# ---- IDEs ----
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated
+.springBeans
+.sts4-cache
+out/
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Docker volumes / local data ----
+.docker-data/
+
+# ---- Environment ----
+.env
+.env.local
+
+# ---- Docs (not needed inside any image) ----
+docs/
+README.md
+TASKS.md

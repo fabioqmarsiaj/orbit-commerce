@@ -1,0 +1,16 @@
+# Phase 9: Grafana dashboard provisioning-as-code — points Grafana at this
+# folder for JSON dashboard files to auto-load on startup, no manual UI
+# import needed.
+
+apiVersion: 1
+
+providers:
+  - name: orbit-commerce
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
