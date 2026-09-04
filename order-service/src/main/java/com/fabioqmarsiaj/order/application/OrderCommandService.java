@@ -4,11 +4,16 @@ import com.fabioqmarsiaj.order.domain.Order;
 import com.fabioqmarsiaj.order.domain.OrderLineItem;
 import com.fabioqmarsiaj.order.messaging.KafkaTopics;
 import com.fabioqmarsiaj.order.messaging.SagaCommandFactory;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.specific.SpecificRecord;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -47,20 +52,38 @@ import java.util.UUID;
  * Kafka event from a participant service (see the {@code messaging}
  * package's listeners), except {@link #createOrder}, which handles the
  * initial {@code POST /orders} API call.
+ *
+ * <p>Since this is the only class in the project with visibility over a
+ * Saga's entire lifecycle (start to terminal transition), it's also where
+ * the Phase 9 custom Saga metrics live: {@code orbit.saga.duration} (a
+ * {@link Timer}, recorded at every terminal transition — see
+ * {@link #recordSagaDuration}) and {@code orbit.saga.compensation} (a
+ * {@link Counter}, incremented only in the 3 compensation-triggering
+ * handlers — see {@link #recordCompensation}). Both deliberately tag with a
+ * small, fixed-cardinality discriminator ({@code outcome}/{@code trigger})
+ * rather than the triggering event's free-text {@code reason} field, which
+ * would create one Prometheus time series per distinct reason string
+ * (unbounded cardinality) — see {@code docs/decisions.md} ("Phase 9 —
+ * Observability") for the full reasoning.
  */
 @Slf4j
 @Service
 public class OrderCommandService {
 
+    private static final String SAGA_DURATION_METRIC = "orbit.saga.duration";
+    private static final String SAGA_COMPENSATION_METRIC = "orbit.saga.compensation";
+
     private final OrderEventStore eventStore;
     private final OutboxWriter outboxWriter;
     private final SagaCommandFactory commandFactory;
+    private final MeterRegistry meterRegistry;
 
     public OrderCommandService(OrderEventStore eventStore, OutboxWriter outboxWriter,
-                                SagaCommandFactory commandFactory) {
+                                SagaCommandFactory commandFactory, MeterRegistry meterRegistry) {
         this.eventStore = eventStore;
         this.outboxWriter = outboxWriter;
         this.commandFactory = commandFactory;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -104,6 +127,9 @@ public class OrderCommandService {
         order.markStockRejected(reason);
         persistAndPullEvents(order);
         // No outgoing command — the Saga ends here for this order.
+
+        recordCompensation("STOCK_REJECTED");
+        recordSagaDuration(order, "CANCELLED");
     }
 
     /**
@@ -130,6 +156,9 @@ public class OrderCommandService {
         persistAndPullEvents(order);
 
         recordCommand(orderId, KafkaTopics.INVENTORY_COMMANDS, commandFactory.releaseStock(order));
+
+        recordCompensation("PAYMENT_DECLINED");
+        recordSagaDuration(order, "CANCELLED");
     }
 
     /**
@@ -142,6 +171,8 @@ public class OrderCommandService {
         Order order = eventStore.load(orderId);
         order.markShipmentCreated(shipmentId);
         persistAndPullEvents(order);
+
+        recordSagaDuration(order, "COMPLETED");
     }
 
     /**
@@ -157,6 +188,9 @@ public class OrderCommandService {
 
         recordCommand(orderId, KafkaTopics.PAYMENT_COMMANDS, commandFactory.refundPayment(order));
         recordCommand(orderId, KafkaTopics.INVENTORY_COMMANDS, commandFactory.releaseStock(order));
+
+        recordCompensation("SHIPMENT_FAILED");
+        recordSagaDuration(order, "FAILED");
     }
 
     /**
@@ -183,5 +217,57 @@ public class OrderCommandService {
         outboxWriter.writeCommand(orderId, topic, command);
         log.info("Order {}: recorded {} command to outbox for topic {}",
                 orderId, command.getClass().getSimpleName(), topic);
+    }
+
+    /**
+     * Records the {@code orbit.saga.duration} {@link Timer}, called from
+     * every one of the 4 handlers above that transitions an order to a
+     * terminal state ({@code COMPLETED}/{@code CANCELLED}/{@code FAILED}).
+     * Duration is measured from {@link Order#getCreatedAt()} (the
+     * {@code OrderCreated} event's timestamp) to now — the full wall-clock
+     * lifetime of the Saga for this order, across every participant
+     * service's async round-trip.
+     *
+     * <p>Tagged with {@code outcome}, a fixed 3-value discriminator
+     * ({@code COMPLETED}/{@code CANCELLED}/{@code FAILED}) — bounded
+     * cardinality, safe for Prometheus.
+     *
+     * <p>{@code publishPercentileHistogram()} makes Micrometer's Prometheus
+     * registry export cumulative histogram buckets (the
+     * {@code orbit_saga_duration_seconds_bucket} series) alongside the
+     * usual {@code _count}/{@code _sum}, which is what lets the Grafana
+     * Saga dashboard (Part E) compute p50/p95 via
+     * {@code histogram_quantile(...)} — a plain {@link Timer} with no
+     * histogram configured only exports {@code _count}/{@code _sum}/
+     * {@code _max}, which is enough for an average but not a percentile.
+     */
+    private void recordSagaDuration(Order order, String outcome) {
+        Duration duration = Duration.between(order.getCreatedAt(), Instant.now());
+        Timer.builder(SAGA_DURATION_METRIC)
+                .tag("outcome", outcome)
+                .publishPercentileHistogram()
+                .register(meterRegistry)
+                .record(duration);
+    }
+
+    /**
+     * Increments the {@code orbit.saga.compensation} {@link Counter},
+     * called only from the 3 handlers above that trigger a compensation
+     * (stock release and/or payment refund).
+     *
+     * <p>Tagged with {@code trigger}, a fixed 3-value discriminator
+     * ({@code STOCK_REJECTED}/{@code PAYMENT_DECLINED}/
+     * {@code SHIPMENT_FAILED} — which {@code handleXxx} method fired) —
+     * deliberately NOT the triggering event's free-text {@code reason}
+     * field, which would create one Prometheus time series per distinct
+     * reason string ever seen (unbounded cardinality, a well-known
+     * footgun). See {@code docs/decisions.md} ("Phase 9 — Observability")
+     * for the full tradeoff writeup.
+     */
+    private void recordCompensation(String trigger) {
+        Counter.builder(SAGA_COMPENSATION_METRIC)
+                .tag("trigger", trigger)
+                .register(meterRegistry)
+                .increment();
     }
 }

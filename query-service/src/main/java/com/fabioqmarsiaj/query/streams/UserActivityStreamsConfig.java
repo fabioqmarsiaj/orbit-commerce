@@ -47,6 +47,35 @@ import java.time.Duration;
  * equivalent of the {@code eventType} discriminator string pattern used
  * everywhere else in this project (outbox rows, order-service's event
  * store, this same service's own {@code timeline_entries} table).
+ *
+ * <p>Phase 9 (Part C, custom Saga/observability metrics) originally
+ * planned to add a manual {@code StreamsBuilderFactoryBeanConfigurer} bean
+ * here, registering {@code KafkaStreamsMicrometerListener} on the
+ * {@code defaultKafkaStreamsBuilder} {@link org.springframework.kafka.config.StreamsBuilderFactoryBean}
+ * to expose this topology's own internal Kafka Streams metrics (state
+ * store metrics, per-task/thread metrics, rebalance counts) through
+ * {@code /actuator/prometheus} — the standard approach in older Spring
+ * Boot / Spring Kafka versions, where this wiring is NOT auto-configured.
+ * Investigating the actual dependency resolved in this project
+ * ({@code spring-boot-kafka:4.0.6}, via the Spring Boot 4.1.1 BOM) found
+ * that Spring Boot 4 ships this exact wiring as a first-class
+ * auto-configuration: {@code KafkaMetricsAutoConfiguration
+ * .KafkaStreamsMetricsConfiguration} registers a
+ * {@code StreamsBuilderFactoryBeanConfigurer} bean that adds a
+ * {@code KafkaStreamsMicrometerListener} to every
+ * {@code StreamsBuilderFactoryBean} in the context, {@code @ConditionalOnClass}
+ * on {@code KafkaStreamsMetrics}/{@code StreamsBuilderFactoryBean} (both
+ * already on the classpath via {@code kafka-streams} + Part A's
+ * {@code micrometer-registry-prometheus}) and {@code @ConditionalOnBean}
+ * on {@code MeterRegistry} (present since Part A) — no property gate, no
+ * opt-in needed. Adding the same listener manually here would double-bind
+ * it against the same {@code KafkaStreams} instance, so no code change
+ * was needed in this class for Part C: {@code orbit.saga}-style manual
+ * instrumentation is exactly what Part B added to {@code order-service},
+ * but Kafka Streams' own internal metrics arrive "for free" the moment
+ * Part A's dependency lands, same as consumer/producer metrics do. See
+ * {@code docs/decisions.md} ("Phase 9 — Observability") for the full
+ * writeup.
  */
 @Configuration
 @EnableKafkaStreams

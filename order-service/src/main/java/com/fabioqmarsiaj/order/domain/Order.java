@@ -47,6 +47,7 @@ public class Order {
     private String customerId;
     private List<OrderLineItem> items;
     private long totalAmountCents;
+    private Instant createdAt;
 
     /**
      * Events raised by command methods since this instance was created or
@@ -231,6 +232,7 @@ public class Order {
                 this.customerId = e.customerId();
                 this.items = e.items();
                 this.totalAmountCents = e.totalAmountCents();
+                this.createdAt = e.occurredAt();
                 this.status = OrderStatus.CREATED;
             }
             case StockReserved e -> this.status = OrderStatus.STOCK_RESERVED;
@@ -279,5 +281,9 @@ public class Order {
 
     public long getTotalAmountCents() {
         return totalAmountCents;
+    }
+
+    public Instant getCreatedAt() {
+        return createdAt;
     }
 }
