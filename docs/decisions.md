@@ -1395,3 +1395,281 @@ will likely recur:
   dependencies, and may need dependencies explicitly declared that a
   Spring Boot starter would normally provide transitively (e.g.
   `jakarta.persistence-api`) — see the Gradle gotchas above.
+
+---
+
+## Phase 9 — Observability + Dockerization
+
+Planned in `docs/phase9-plan.md` (agreed with the user before
+implementation) and executed in 5 parts, one at a time, with the user
+reviewing after each part. This section is the permanent writeup —
+`phase9-plan.md` can be deleted or kept as historical context.
+
+### Part A — Micrometer + Prometheus on all 5 services
+`implementation("io.micrometer:micrometer-registry-prometheus")` added to
+each of the 5 `build.gradle.kts` files (no explicit version — resolved via
+the Spring Boot 4.1.1 BOM already in play, same no-version style used for
+every other starter in this project), plus
+`management.endpoints.web.exposure.include=health,prometheus` in each
+`application.properties`. All 5 services already had
+`spring-boot-starter-actuator`; none had the Prometheus registry or any
+`management.*` config before this phase.
+
+This alone is enough for Spring Kafka's built-in Micrometer binder
+(`MicrometerConsumerListener`/`MicrometerProducerListener`, transitively
+present once `micrometer-core` is on the classpath) to start auto-
+instrumenting Kafka producer/consumer client metrics — no extra code.
+
+### Part B — Custom Saga metrics (order-service only)
+Only `order-service` is the Saga orchestrator with visibility over an
+order's entire lifecycle; the other 4 services are participants with no
+cross-service view, so this part touches only `order-service`.
+
+- **`Order.java`**: gained a `createdAt` field (populated from
+  `OrderCreated.occurredAt()` in `apply()`) and a `getCreatedAt()` getter
+  — needed because a live `Timer` measuring Saga duration needs the start
+  timestamp at the moment the terminal transition happens; it can't be
+  computed retroactively.
+- **`OrderCommandService`**: `MeterRegistry` added as a 4th constructor
+  parameter (alongside `eventStore`/`outboxWriter`/`commandFactory`,
+  already constructor-injected).
+- **`orbit.saga.duration`** (`Timer`): recorded via a new private
+  `recordSagaDuration(Order, String outcome)` helper, called from the 4
+  handlers that transition an order to a terminal state —
+  `handleShipmentCreated` (`outcome=COMPLETED`), `handleStockRejected`
+  (`CANCELLED`), `handlePaymentDeclined` (`CANCELLED`),
+  `handleShipmentFailed` (`FAILED`). Duration is
+  `Duration.between(order.getCreatedAt(), Instant.now())`.
+- **`orbit.saga.compensation`** (`Counter`): recorded via a new private
+  `recordCompensation(String trigger)` helper, called only from the 3
+  compensation-triggering handlers, tagged `trigger` ∈
+  `{STOCK_REJECTED, PAYMENT_DECLINED, SHIPMENT_FAILED}` — deliberately
+  the *name of the handler that fired*, not the triggering event's
+  free-text `reason` field. Prometheus time series are created per unique
+  label value combination; a free-text field as a tag means one new time
+  series per distinct string ever seen, unbounded and never cleaned up
+  (a well-known Prometheus footgun). Both metrics' tags are fixed,
+  small, enumerable sets instead.
+
+### Part B addendum — `publishPercentileHistogram()` needed for the p50/p95 Grafana panels
+Found while building the Grafana dashboard in Part E, added back into
+Part B's code: a plain `Timer.builder(...).register(...)` only exports
+`_count`/`_sum`/`_max` to Prometheus — not enough for
+`histogram_quantile(...)`, which needs cumulative histogram buckets
+(the `_bucket` series). `Timer.builder(SAGA_DURATION_METRIC).tag(...)
+.publishPercentileHistogram().register(meterRegistry)` was needed for
+`orbit_saga_duration_seconds_bucket` to actually exist, which is what
+`saga-overview.json`'s p50/p95-by-outcome panels query via
+`histogram_quantile(0.50, sum(rate(orbit_saga_duration_seconds_bucket
+[5m])) by (le, outcome))`. The same gap applies to Spring Boot's own
+built-in `http.server.requests` timer (used by the JVM/HTTP dashboard's
+p95 latency panel) — see Part E below.
+
+### Part C — Kafka Streams metrics: no code needed, Spring Boot 4 auto-configures it
+`phase9-plan.md` planned a manual `StreamsBuilderFactoryBeanConfigurer`
+bean in `UserActivityStreamsConfig`, registering
+`KafkaStreamsMicrometerListener` on the `defaultKafkaStreamsBuilder`
+`StreamsBuilderFactoryBean` (`@EnableKafkaStreams` already creates it) —
+this is the standard approach in older Spring Boot / Spring Kafka
+versions, where this wiring is NOT auto-configured, and was assumed to
+still be true here based on general Micrometer-Kafka-Streams integration
+knowledge.
+
+Before writing that bean, the actual `spring-boot-kafka-4.0.6.jar`
+resolved by this project's Spring Boot 4.1.1 BOM was inspected directly
+(bytecode, via `javap`) rather than trusting that assumption, and it
+turned out to be wrong for this specific version: Spring Boot 4 ships a
+first-class auto-configuration,
+`org.springframework.boot.kafka.autoconfigure.metrics
+.KafkaMetricsAutoConfiguration.KafkaStreamsMetricsConfiguration`,
+which registers exactly the same `StreamsBuilderFactoryBeanConfigurer`
+bean the plan proposed writing by hand:
+```java
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnClass({ KafkaStreamsMetrics.class, StreamsBuilderFactoryBean.class })
+class KafkaStreamsMetricsConfiguration {
+    @Bean
+    @ConditionalOnBean(MeterRegistry.class)
+    StreamsBuilderFactoryBeanConfigurer kafkaStreamsMetrics(MeterRegistry registry) {
+        return factoryBean -> factoryBean.addListener(new KafkaStreamsMicrometerListener(registry));
+    }
+}
+```
+Both conditions (`KafkaStreamsMetrics`/`StreamsBuilderFactoryBean` on the
+classpath, a `MeterRegistry` bean present) were already satisfied in
+`query-service` the moment Part A landed — `kafka-streams` was already a
+dependency (Phase 7), and `micrometer-registry-prometheus` (Part A)
+registers the `MeterRegistry` bean. No property gate exists; this is
+opt-out, not opt-in.
+
+**Net result:** zero functional code change in `query-service`.
+Registering the same listener manually would have double-bound metrics
+against the same `KafkaStreams` instance. Instead, `UserActivityStreamsConfig`
+gained a detailed Javadoc paragraph explaining this finding, so a future
+reader doesn't waste time re-deriving it (or worse, re-adding the
+now-redundant bean). Kafka Streams' own internal metrics (state store
+metrics, per-task/thread metrics, rebalance counts) are exposed on
+`/actuator/prometheus` automatically, the same way consumer/producer
+metrics are (Part A) — no manual instrumentation needed, unlike the
+`orbit.saga.*` metrics in Part B, which genuinely have no automatic
+equivalent since they're project-specific business metrics.
+
+**Lesson for future phases:** when a plan makes a claim about what a
+framework does or doesn't auto-configure, especially across a major
+version bump (Spring Boot 4 restructured its autoconfigure packages
+significantly — see `org.springframework.boot.kafka.autoconfigure.*`
+vs. the pre-4.0 `org.springframework.boot.autoconfigure.kafka.*`),
+verify against the actual resolved jar before writing code, not just
+general framework knowledge that may predate the version in use.
+
+### Part D — Dockerizing the 5 Java services
+Expanded scope, user-requested: simplifies Prometheus scrape config (real
+service DNS names inside the Docker network instead of
+`host.docker.internal`) and makes the whole observability stack
+self-contained. No Dockerfile existed anywhere in the project before this
+phase; all 5 services ran via `bootRun` against Dockerized infra only.
+
+- **`.dockerignore`** (new, repo root) — excludes `.git/`, every module's
+  `build/`/`.gradle/`/`.idea/`, `ingestion-service/` build artifacts,
+  `docs/`, `README.md`, `TASKS.md`, etc.
+- **One `Dockerfile` per service**, multi-stage, **build context = repo
+  root** (`docker build -f order-service/Dockerfile .`) — required because
+  this is a Gradle multi-module monorepo: each service depends on
+  `:event-schemas`/`:outbox-support` at the root, so Docker needs to see
+  the whole tree, not just the service's own folder.
+  - Stage `build`: `eclipse-temurin:21-jdk-alpine`, `COPY . .` (the whole
+    repo, filtered by `.dockerignore`), `./gradlew :service-name:bootJar
+    --no-daemon` (`--no-daemon` avoids a lingering Gradle daemon process
+    keeping the build-stage container alive after the task finishes).
+  - Stage `runtime`: `eclipse-temurin:21-jre-alpine`, copies only
+    `build/libs/*.jar` from the build stage as `app.jar`, `ENTRYPOINT
+    ["java", "-jar", "app.jar"]` — none of the JDK, Gradle wrapper, source
+    tree, or other modules' build output ends up in the runtime image.
+- **`application.properties`** (all 5 services): every hardcoded
+  `localhost` reference (`spring.datasource.url`,
+  `spring.kafka.bootstrap-servers`, every `...schema.registry.url`
+  occurrence including query-service's Streams properties) became an
+  env-var placeholder with the current value as the default —
+  `${DB_HOST:localhost}`, `${KAFKA_BOOTSTRAP:localhost:9092}`,
+  `${SCHEMA_REGISTRY_URL:http://localhost:8081}`. Running via `bootRun`
+  locally with no env vars set behaves identically to before this phase;
+  only the Compose `apps` profile (below) actually sets these vars.
+- **`docker-compose.yml`**: 5 new services (`order-service`,
+  `inventory-service`, `payment-service`, `shipping-service`,
+  `query-service`), each under `profiles: ["apps"]`, `build: { context:
+  ., dockerfile: <service>/Dockerfile }`, `depends_on` on
+  `postgres`/`broker`/`schema-registry` with `condition: service_healthy`
+  (matching the existing pattern used by `kafka-init`/`schema-registry`/
+  `kafka-ui`), `environment: { DB_HOST: postgres, KAFKA_BOOTSTRAP:
+  broker:19092, SCHEMA_REGISTRY_URL: http://schema-registry:8081 }`, and
+  the existing host port mappings preserved (`8082:8082`, etc.) so manual
+  `curl`/Postman testing against `localhost:808X` keeps working whether a
+  service is running via `bootRun` or via Compose. Container names follow
+  the existing `orbit-<name>` convention.
+- **Compose profile strategy**: all 5 services (and, per Part E, the
+  observability stack too) live under a new `apps` profile, not the
+  default one. Plain `docker compose up -d` (today's exact command)
+  keeps bringing up ONLY the pre-existing infra (`broker`, `kafka-init`,
+  `schema-registry`, `postgres`, `kafka-ui`) — zero change to the
+  established `bootRun`-based dev workflow from every prior phase.
+  `docker compose --profile apps up -d --build` brings up everything.
+- **`scripts/env-up.ps1`**: gained an `-Apps` switch that prepends
+  `--profile apps` to the `docker compose up` invocation and prints the
+  5 services' URLs (plus Prometheus/Grafana, added in Part E) when used.
+- **`ingestion-service` (Go) stays undockerized** this phase — not part
+  of the original observability request, doesn't participate in the
+  Saga, can be revisited later if ever needed.
+
+Validated via `docker compose config --quiet` (both with and without
+`COMPOSE_PROFILES=apps` set) and `.\gradlew.bat compileJava
+compileTestJava` after the `application.properties` changes. The actual
+`docker compose --profile apps up -d --build` + manual Grafana/Prometheus
+verification was deferred to the user's personal machine — the corporate
+machine used for implementation hits a Docker build-time certificate
+error unrelated to this project's configuration.
+
+### Part E — Observability infra (Prometheus, Grafana, kafka-exporter)
+- **`infra/prometheus/prometheus.yml`**: scrape configs targeting
+  Docker-network service DNS names (`order-service:8082`,
+  `inventory-service:8083`, `payment-service:8084`,
+  `shipping-service:8085`, `query-service:8086`, all at
+  `/actuator/prometheus`), plus `kafka-exporter:9308` and Prometheus's
+  own self-scrape.
+- **`docker-compose.yml`** additions (all under the `apps` profile — a
+  Prometheus instance with no Java services running has nothing useful
+  to scrape, so it's bundled with the apps rather than the default
+  profile):
+  - `prometheus` (`prom/prometheus:v3.14.0`), container
+    `orbit-prometheus`, port `9090:9090`, mounts
+    `./infra/prometheus/prometheus.yml:ro`, `depends_on` the 5 app
+    services (`condition: service_started` — no healthcheck needed for
+    pure scrape targets).
+  - `kafka-exporter` (`danielqsj/kafka-exporter:v1.9.0`), container
+    `orbit-kafka-exporter`, `--kafka.server=broker:19092` (the internal
+    listener, same one `kafka-init`/`schema-registry` already use, not
+    the external `PLAINTEXT_HOST` one), `depends_on: broker
+    (service_healthy)`.
+  - `grafana` (`grafana/grafana:13.2.1`), container `orbit-grafana`, port
+    `3000:3000`, mounts
+    `./infra/grafana/provisioning:/etc/grafana/provisioning:ro`,
+    `depends_on: prometheus`.
+- **Image version pins**: all 3 explicitly versioned (`v3.14.0`,
+  `13.2.1`, `v1.9.0`), consistent with almost everything else in the
+  project (`postgres:16-alpine`, `apache/kafka:4.3.1`, etc.) — verified
+  as the latest stable/explicitly-versioned tags via Docker Hub before
+  picking them. `kafka-ui`'s `:latest` remains the documented exception
+  (Phase 1), not a pattern extended further.
+- **`infra/grafana/provisioning/datasources/prometheus.yml`**: Grafana
+  provisioning-as-code datasource pointing at `http://prometheus:9090`,
+  auto-loaded on startup, no manual UI setup needed.
+- **`infra/grafana/provisioning/dashboards/dashboards.yml`**: dashboard
+  provider config, pointing Grafana at the same folder for JSON
+  dashboard files to auto-load.
+- **Three dashboards**, per the hybrid decision made with the user
+  (hand-build only the Saga-specific one from scratch, adapt the generic
+  JVM/HTTP and Kafka-consumer-lag ones from well-known community
+  dashboard shapes rather than importing them verbatim, since Grafana's
+  file-based provisioning here needs self-contained JSON, not an
+  internet-fetched import):
+  - **`saga-overview.json`** — `orbit.saga.duration` p50/p95 by
+    `outcome` (via `histogram_quantile(...)` over
+    `orbit_saga_duration_seconds_bucket` — see the Part B addendum
+    above for why `publishPercentileHistogram()` was required),
+    `orbit.saga.compensation` rate by `trigger`, Saga completions by
+    outcome, and `POST /orders` throughput.
+  - **`jvm-overview.json`** — heap used, live threads, GC pause rate,
+    process CPU usage, HTTP request rate and p95 latency, all templated
+    by a `$job` variable (multi-select across all 5 services' Prometheus
+    job labels) so one dashboard covers every service instead of
+    needing 5 near-identical copies.
+  - **`kafka-consumer-lag.json`** — consumer group lag by
+    topic/partition, lag summed by consumer group, topic partition
+    offsets, and broker/topic message rate — all from kafka-exporter's
+    `kafka_consumergroup_lag`/`kafka_topic_partition_current_offset`
+    metrics.
+- **HTTP request histogram**: `management.metrics.distribution
+  .percentiles-histogram.http.server.requests=true` added to all 5
+  `application.properties` (found necessary while building
+  `jvm-overview.json`'s p95 latency panel — same underlying reason as
+  the Part B addendum: Spring Boot's built-in `http.server.requests`
+  `Timer` doesn't export histogram buckets by default either, so
+  `histogram_quantile(...)` would have nothing to compute against
+  without this).
+- **`scripts/env-up.ps1`**: `-Apps` banner extended with `Prometheus:
+  http://localhost:9090` and `Grafana: http://localhost:3000 (admin/admin
+  default login)`.
+
+Validated: `docker compose config --quiet` (default and `apps` profile),
+all 3 dashboard JSON files parsed successfully via PowerShell's
+`ConvertFrom-Json`, the 3 new/changed YAML provisioning files reviewed
+manually for indentation correctness, and `.\gradlew.bat compileJava
+compileTestJava` succeeded after the `Timer.publishPercentileHistogram()`
+and `application.properties` changes. As with Part D, the actual
+`docker compose --profile apps up -d --build` run plus manual
+Prometheus-targets/Grafana-dashboard verification is deferred to the
+user's personal machine.
+
+### Ports used by this phase
+`9090` (Prometheus), `3000` (Grafana), `9308` (kafka-exporter) — all
+confirmed free beforehand (no conflicts with the existing
+`8080`-`8086`, `9092`, `9093`, `19092`, `5432`).

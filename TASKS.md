@@ -24,7 +24,7 @@ Priority legend: P0 (critical/blocking) · P1 (essential) · P2 (nice-to-have)
 - [x] P1 Kafka topic creation via init script (order.events, inventory.commands,
       inventory.events, payment.commands, payment.events, shipping.commands, shipping.events,
       user-activity.events) — one-shot `kafka-init` container running `infra/kafka/init-topics.sh`
-- [ ] P2 Prometheus + Grafana + kafka-exporter (deferred to Phase 9)
+- [x] P2 Prometheus + Grafana + kafka-exporter (deferred to Phase 9) — implemented in Phase 9
 - [x] P1 PowerShell scripts (`scripts/env-up.ps1`, `env-down.ps1`, `env-logs.ps1`) to bring the
       local environment up/down
 
@@ -378,11 +378,35 @@ full design writeup, including the library choices (hamba/avro/v2 vs goavro,
 kafka-go vs confluent-kafka-go) and the bug investigation.
 
 ## Phase 9 — Observability
-- [ ] P1 Micrometer + Prometheus on all Spring services
-- [ ] P1 Custom metrics: saga duration, compensation rate by failure type
-- [ ] P1 kafka-exporter for consumer lag metrics
-- [ ] P1 Grafana dashboards (throughput, saga latency, consumer lag)
-- [ ] P2 Distributed tracing (OpenTelemetry + Jaeger/Tempo) — time permitting
+- [x] P1 Micrometer + Prometheus on all Spring services — `micrometer-registry-prometheus` +
+      `management.endpoints.web.exposure.include=health,prometheus` on all 5 services; Kafka
+      Streams metrics (query-service) come for free via a Spring Boot 4 auto-configuration, no
+      code needed (see docs/decisions.md)
+- [x] P1 Custom metrics: saga duration, compensation rate by failure type — `orbit.saga.duration`
+      (Timer, tag `outcome`) + `orbit.saga.compensation` (Counter, tag `trigger`), order-service
+      only (the Saga orchestrator)
+- [x] P1 kafka-exporter for consumer lag metrics — `danielqsj/kafka-exporter:v1.9.0`
+- [x] P1 Grafana dashboards (throughput, saga latency, consumer lag) — `saga-overview.json`
+      (hand-built), `jvm-overview.json`, `kafka-consumer-lag.json`, all provisioned as code
+- [ ] P2 Distributed tracing (OpenTelemetry + Jaeger/Tempo) — time permitting (deferred)
+
+Expanded scope (user-requested, beyond the original 5 items above): the 5 Java services are now
+also dockerized (multi-stage `Dockerfile` per service, build context = repo root), and everything
+(the 5 services + Prometheus + Grafana + kafka-exporter) lives under a new Compose `apps` profile
+— `docker compose up -d` (unchanged) still brings up only the pre-existing infra;
+`docker compose --profile apps up -d --build` brings up the whole observable system. See
+`docs/decisions.md` ("Phase 9 — Observability + Dockerization") for the full writeup, including a
+real finding that diverged from the original plan (Spring Boot 4 auto-configures Kafka Streams
+Micrometer metrics — no manual listener bean needed) and two additions required to make the
+Grafana dashboards' percentile panels actually work (`Timer.publishPercentileHistogram()` on
+`orbit.saga.duration`, and `management.metrics.distribution.percentiles-histogram.http.server.requests=true`
+on all 5 services).
+
+Code-level validation performed by the assistant: `.\gradlew.bat compileJava compileTestJava`
+after every part, and `docker compose config --quiet` (default and `apps` profile) after the
+Compose changes. The actual `docker compose --profile apps up -d --build` run plus manual
+Prometheus/Grafana verification is deferred to the user's personal machine (the corporate machine
+used for implementation hits a Docker build-time certificate error unrelated to this project).
 
 ## Phase 10 — Documentation and polish
 - [ ] P0 Main README: overview, architecture, how to bring up the environment
